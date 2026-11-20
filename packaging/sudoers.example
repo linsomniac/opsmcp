@@ -1,0 +1,10 @@
+# Install as /etc/sudoers.d/opsmcp (edit with: visudo -f /etc/sudoers.d/opsmcp).
+#
+# Lets members of group "ops" start the stdio server as root, and nothing else. sudo
+# matches the command and its arguments exactly, so `opsmcp serve --config /tmp/mine`
+# is not allowed by this rule; the configuration is always /etc/opsmcp/config.toml.
+#
+# opsmcp sees who invoked sudo (SUDO_UID) and applies that user's roles. Being able to
+# start it grants nothing by itself: a user with no role is turned away.
+
+%ops ALL=(root) NOPASSWD: /usr/bin/opsmcp serve

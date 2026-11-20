@@ -1,0 +1,34 @@
+# opsmcp over HTTPS. Install as /etc/systemd/system/opsmcp-http.service.
+#
+# (Local and SSH use need no service: `opsmcp serve` is started by the caller.)
+
+[Unit]
+Description=opsmcp operations MCP server (HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/bin/opsmcp check-config
+ExecStart=/usr/bin/opsmcp serve-http
+Restart=on-failure
+RestartSec=5
+
+# Runs as root because the tools it offers need it (signals, systemctl, iptables,
+# /proc/sys). What a caller can actually do is decided by the roles in the
+# configuration, and every call is audited.
+User=root
+
+# Bounds on what the service and the commands it runs can consume.
+LimitNOFILE=4096
+TasksMax=512
+
+# Hardening that does not get in the way of the tools. Deliberately NOT set:
+# NoNewPrivileges, ProtectSystem, ProtectKernelTunables, PrivateTmp and the like, which
+# would break sysctl_set, service control, NRPE checks that use sudo, or custom commands.
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,52 @@
+[package]
+name = "opsmcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "MCP server giving AI agents audited, permission-controlled access to Linux operations tasks"
+publish = false
+
+[dependencies]
+bytes = "1.12.2"
+clap = { version = "4.6.8", features = ["derive"] }
+flate2 = "1.1.11"
+getrandom = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+log = "0.4.35"
+nix = { version = "0.32.0", features = ["user", "fs", "signal"] }
+regex = "1.13.2"
+rustix = { version = "1.1.6", features = ["fs", "process", "param"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "signal", "sync", "net", "fs"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+toml = "1.2.1"
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+# AIDEV-NOTE: overflow checks stay on in release; a tool call that hits an arithmetic bug
+# panics inside its own task (reported as an internal error) rather than wrapping silently.
+overflow-checks = true
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,29 @@
+I'd like to make an MCP or MCP-like server for doing operations-related things.  Let's
+start off with the basics: I'd like this to be written in rust.  It needs to be really
+reliable, robust, and secure.  I'd like it to be able to run in multiple different ways:
+via the CLI (so claude can talk to a local instance), via a secured HTTP (maybe via an
+API token of some sort, definitely TLS secured in any case but probably also the ability
+to use TLS certs for auth), and over SSH (which will likely be a variant of the CLI, but
+rather than taking commands on the command line it'd take them via stdin, like "opsmcp
+serve" and then write the command to the process stdin; maybe that's the way the local one
+works as well and doesn't need any CLI arguments for the MCP interaction?).  It is going
+to need some sort of permission granting system saying things like "this user is allowed
+read-only access, this user is allowed read+write, where MCP commands are tagged as being
+read-only or read+write, but it probably should also allow for fine-grained permissions
+like "can view logs", "can modify users", "can restart services").
+
+As far as what this service does, the goal is to allow AI agents like Claude Code to do a
+variety of operations-type operations: view processes, view memory and disc statistics,
+send signals to processes, start and stop and view containers and processes (like via
+systemd), view logs in /var/log (and likely other configurable log locations) and
+`journalctl`, view the kernel log (`dmesg`), view firewall information including rules and
+counters, reset and modify rules (firewall should probably include iptables as well as
+nftables), view/set sysctl values (including `/proc` and `/sys` values?), view the
+filesystem, view podman + docker containers, view and modify corosync/pacemaker cluster
+status, check the status of nrpe checks.  That should be a good solid list to get started.
+
+It should also allow a the admin to define custom commands, like in our case we have a
+"haproxystatus" program that allows us to tell the haproxyagent service on the system to
+mark the system as up or down in haproxy, and view the current status.  Another example is
+we have a script that requests a new TLS cert from our CA.  Another example is we have a
+script that shows the status of our galera cluster.

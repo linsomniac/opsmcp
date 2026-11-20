@@ -1,0 +1,199 @@
+# opsmcp configuration. Install as /etc/opsmcp/config.toml.
+#
+# The file must be owned by root and writable by nobody else (chmod 600 or 640);
+# opsmcp refuses to start otherwise. After every change, check it with:
+#
+#     opsmcp check-config
+#
+# The starting point is "nothing is allowed": a caller can do only what a role grants,
+# and nobody is a caller unless listed here. A misspelled setting is an error.
+
+# ---- Roles: named sets of grants ---------------------------------------------------
+#
+# A grant is PERMISSION or PERMISSION:RESOURCE. `opsmcp tools` lists every permission.
+#
+#   "@read"                           every tool tagged read-only
+#   "@all"                            everything
+#   "service.control"                 one permission, on anything
+#   "service.*"                       a glob over permission names
+#   "service.control:nginx.service"   one permission, on one thing
+#   "fs.read:/etc/haproxy/**"         ... or on a glob of things
+#
+# In a resource glob, * matches within one path segment and ** matches across them.
+# A "deny" always wins over an "allow", across all the roles a caller holds. A deny for
+# one resource also rules out the "everything at once" operations of that permission
+# (querying the whole journal, listing every process), since they would include it.
+
+[roles.readonly]
+allow = ["@read"]
+deny = ["fs.read:/etc/ssl/**"]
+
+[roles.web-operator]
+allow = [
+    "@read",
+    "service.control:nginx.service",
+    "service.control:haproxy.service",
+    "container.control:web-*",
+    "custom.haproxy_set",
+]
+
+[roles.admin]
+allow = ["@all"]
+
+# ---- Callers -------------------------------------------------------------------------
+
+# Local and SSH use (`opsmcp serve`): by Unix account or group. For tools that need
+# root, run it through sudo; see sudoers.example. The caller is then the invoking user.
+[unix_users.sean]
+roles = ["admin"]
+
+[unix_groups.ops]
+roles = ["web-operator"]
+
+# HTTPS (`opsmcp serve-http`): bearer tokens. `opsmcp new-token NAME` prints a token
+# and this stanza; only the hash is stored here.
+[tokens.claude-ci]
+# AIDEV-NOTE: placeholder made from discarded random bytes, so no token matches it.
+# Never put the hash of a known word here: this file gets copied into production.
+sha256 = "70eb5cf8457c1dccc32736c897af3b91c2ad5680db472f1ec27653a574951c2b"
+roles = ["readonly"]
+expires = "2027-12-31" # optional: the last day it is valid (UTC)
+
+# HTTPS: TLS client certificates issued by http.client_ca, matched by subject common
+# name (cn) or by the SHA-256 fingerprint of one exact certificate (sha256).
+[client_certs.sean-laptop]
+cn = "sean"
+roles = ["admin"]
+
+# ---- HTTPS transport -----------------------------------------------------------------
+
+[http]
+listen = "0.0.0.0:8443"
+tls_cert = "/etc/opsmcp/tls/server.crt"
+tls_key = "/etc/opsmcp/tls/server.key"
+# The CA that client certificates must be issued by (needed for the mtls modes).
+client_ca = "/etc/opsmcp/tls/clients-ca.crt"
+# Who may connect:
+#   "token"          a bearer token (the default)
+#   "mtls"           a client certificate listed under [client_certs]
+#   "mtls+token"     any certificate from client_ca AND a bearer token
+#   "mtls-or-token"  either
+auth = "mtls-or-token"
+# Browser origins allowed to call the server. Leave empty unless a web page needs to.
+allowed_origins = []
+max_connections = 64 # one client address may hold at most half of these
+
+# ---- Audit ---------------------------------------------------------------------------
+#
+# Every call is recorded, allowed or not, as one JSON object per line.
+
+[audit]
+syslog = true # to the local syslog (facility authpriv), and from there wherever it ships
+# file = "/var/log/opsmcp/audit.jsonl"
+fail_closed = true # do not run a tool whose audit record cannot be written
+
+# ---- Limits --------------------------------------------------------------------------
+
+[limits]
+max_output_bytes = 65536  # largest result returned to the agent
+command_timeout_secs = 30 # one external command
+call_timeout_secs = 120   # one whole tool call
+max_concurrent_calls = 8
+max_request_bytes = 1048576
+
+# ---- What the tools may touch on this host ------------------------------------------
+#
+# These apply to everyone, whatever their role grants.
+
+[logs]
+dirs = ["/var/log"]
+
+[fs]
+list_roots = ["/"] # directories that may be listed and stat'ed
+# Directories whose files may be read. Paths are judged by where they really are, so a
+# link out of these directories does not get around them.
+read_roots = ["/etc", "/proc", "/sys", "/usr/local/etc"]
+# Never listed or read, in addition to the built-in list (shadow files, private keys,
+# SSH and cloud credentials, process environments...).
+deny = ["/etc/mysql/debian.cnf", "**/*.env"]
+
+[kernel]
+# sysctl names and /sys files that may be changed. Empty: none.
+writable_sysctls = ["vm.swappiness", "net.ipv4.ip_forward"]
+writable_sysfs = ["/sys/kernel/mm/transparent_hugepage/enabled"]
+
+[services]
+# Units that can never be controlled, enabled or disabled through opsmcp.
+protected = [
+    "systemd-journald.service",
+    "systemd-logind.service",
+    "systemd-udevd.service",
+    "dbus.service",
+    "dbus-broker.service",
+    "opsmcp*",
+]
+
+[tools]
+# Built-in tools to switch off entirely on this host.
+disabled = []
+
+[nrpe]
+# config = "/etc/nagios/nrpe.cfg" # default: the usual locations are tried
+
+[paths]
+# Where system commands are looked for. The caller's PATH is never used.
+# search = ["/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/sbin", "/usr/local/bin"]
+
+# [paths.bin]
+# systemctl = "/usr/bin/systemctl" # the exact location of one command
+
+# ---- Custom tools --------------------------------------------------------------------
+#
+# Your own commands, offered to agents as tools. "command" is an argument list: the
+# first element is the program (absolute path), and no shell is involved.
+#   {name}        replaced by the parameter; the element is left out if it was not given
+#   {name?text}   becomes "text" when the boolean parameter is true, else left out
+# A tool's permission is custom.NAME; "access" says whether @read covers it.
+
+[custom.haproxy_status]
+description = "Show whether this host is marked up, down or draining in HAProxy (through haproxyagent)."
+access = "read"
+command = ["/usr/local/sbin/haproxystatus", "status"]
+
+[custom.haproxy_set]
+description = "Mark this host up, down or draining in HAProxy (through haproxyagent). Drain before maintenance; set up again afterwards."
+access = "write"
+command = ["/usr/local/sbin/haproxystatus", "{state}"]
+
+[custom.haproxy_set.params.state]
+type = "enum"
+description = "State to set"
+values = ["up", "down", "drain"]
+required = true
+
+[custom.cert_request]
+description = "Request a new TLS certificate for this host from the internal CA."
+access = "write"
+command = ["/usr/local/sbin/request-cert", "--hostname", "{hostname}", "{force?--force}"]
+timeout_secs = 120
+
+[custom.cert_request.params.hostname]
+type = "string"
+description = "Host name the certificate is for"
+# Must match the whole value. Without a pattern, a string may hold letters, digits and
+# _ . : @ / = + , - and may not start with "-".
+pattern = "[a-z0-9]([a-z0-9.-]*[a-z0-9])?"
+max_len = 253
+required = true
+
+[custom.cert_request.params.force]
+type = "boolean"
+description = "Replace a certificate that is still valid"
+
+[custom.galera_status]
+description = "Show the state of the Galera cluster as seen from this node: size, node state and flow control."
+access = "read"
+command = ["/usr/local/sbin/galera-status"]
+run_as = "mysql" # needs opsmcp to run as root
+timeout_secs = 20
+ok_exit_codes = [0, 1] # exit codes that are an answer rather than a failure
