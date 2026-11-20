@@ -182,6 +182,34 @@ impl Ctx {
             .denies(&call.permission, call.access, resource)
     }
 
+    /// Whether the policy would allow this call on `resource`. Nothing is audited.
+    ///
+    /// AIDEV-NOTE: for filtering only. A tool that walks a tree or lists many things
+    /// authorizes (and so audits) the operation itself with `authorize`, then uses this to
+    /// leave out the items the caller could not have asked for one at a time. It must
+    /// never be used INSTEAD of `authorize`.
+    pub fn permits(&self, resource: &str) -> bool {
+        let call = &self.call;
+        call.principal
+            .rules
+            .check(&call.permission, call.access, Some(resource))
+    }
+
+    /// Whether the caller also holds `permission`, which must be the permission of a READ
+    /// tool, for everything it covers (not just for some resources). Nothing is audited.
+    ///
+    /// AIDEV-NOTE: for tools that assemble several views into one answer
+    /// (incident_snapshot). Each part is included only if the caller could have got it
+    /// from the tool that owns that permission, so a combined tool can never show what a
+    /// deny, or a missing grant, keeps from the caller elsewhere. Only pass the name of a
+    /// read permission: the `@read` group is taken to cover whatever is named here.
+    pub fn holds_read(&self, permission: &str) -> bool {
+        self.call
+            .principal
+            .rules
+            .check(permission, Access::Read, None)
+    }
+
     /// How much text a tool should produce at most, leaving room in the server's output
     /// limit for a header and notes. Tools that would exceed it choose what to keep
     /// (the newest lines of a log, a whole number of characters of a file) rather than
@@ -285,6 +313,13 @@ impl Ctx {
     pub fn command(&self, name: &str) -> Result<Cmd, ToolError> {
         let program = self.host.bins.find(name).map_err(ToolError::Failed)?;
         Ok(self.command_at(program))
+    }
+
+    /// A system command that may well not be installed: `Ok(None)` when it is not there.
+    /// One that is there but may not be run is an error, as with `command`.
+    pub fn optional_command(&self, name: &str) -> Result<Option<Cmd>, ToolError> {
+        let found = self.host.bins.lookup(name).map_err(ToolError::Failed)?;
+        Ok(found.map(|program| self.command_at(program)))
     }
 
     /// A command at a known path, with the configured time limit.

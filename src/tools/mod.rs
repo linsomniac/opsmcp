@@ -1,6 +1,7 @@
 //! The tools the server offers, and the context a tool runs in.
 
 pub mod args;
+pub mod checks;
 pub mod cluster;
 pub mod container;
 mod ctx;
@@ -9,16 +10,26 @@ pub mod firewall;
 pub mod fs;
 pub mod kernel;
 pub mod logs;
+pub mod net;
 pub mod nrpe;
+pub mod package;
 pub mod paths;
 pub mod process;
+pub mod reboot;
+pub mod schedule;
 pub mod service;
+pub mod storage;
 pub mod system;
+pub mod timesync;
+pub mod tls;
+pub mod triage;
+pub mod users;
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::exec::CmdOutput;
@@ -97,6 +108,41 @@ where
     .map_err(|e| ToolError::Internal(format!("blocking task failed: {e}")))?
 }
 
+/// The time that the commands of one call share.
+///
+/// AIDEV-NOTE: a call that outlasts `limits.call_timeout_secs` is cut off and returns
+/// nothing at all. A tool that runs several commands one after another therefore gives
+/// each of them at most what is left of the call, keeps some back for sending the
+/// answer, and starts no command once nothing is left. One section saying that it ran
+/// out of time is better than no answer.
+pub struct CallClock {
+    deadline: Instant,
+    command: Duration,
+}
+
+impl CallClock {
+    /// Starts the clock: call it when the tool begins.
+    pub fn start(ctx: &Ctx) -> CallClock {
+        let limits = &ctx.cfg().limits;
+        // Kept back for putting the answer together: a quarter of the call, at least a
+        // second and at most ten.
+        let reserve = (limits.call_timeout_secs / 4).clamp(1, 10);
+        let usable = limits.call_timeout_secs.saturating_sub(reserve);
+        CallClock {
+            deadline: Instant::now() + Duration::from_secs(usable),
+            command: Duration::from_secs(limits.command_timeout_secs),
+        }
+    }
+
+    /// The time limit for the next command: the usual limit for a command, or what is
+    /// left of the call if that is less. `None` when there is too little left to be
+    /// worth starting one.
+    pub fn next(&self) -> Option<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        (left >= Duration::from_secs(1)).then(|| self.command.min(left))
+    }
+}
+
 /// A required string argument. (The dispatcher has already checked it is present; this
 /// keeps tools free of unwraps.)
 pub fn required<'a>(args: &'a Args, name: &str) -> Result<&'a str, ToolError> {
@@ -150,7 +196,15 @@ pub fn format_table(headers: &[&str], rows: &[Vec<String>], right: &[bool]) -> S
 }
 
 /// `format_table` without a header line.
+///
+/// AIDEV-NOTE: cells hold host data (a process's arguments, a file name, a drive's model
+/// string). A line break inside a cell would let that data add rows of its own that look
+/// like the tool's, so line breaks and tabs in cells are shown as `\\n`, `\\r`, `\\t`.
 pub fn format_rows(rows: &[Vec<String>], right: &[bool]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| one_line_cell(cell)).collect())
+        .collect();
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> = (0..columns)
         .map(|column| {
@@ -162,7 +216,7 @@ pub fn format_rows(rows: &[Vec<String>], right: &[bool]) -> String {
         })
         .collect();
     let mut out = String::new();
-    for row in rows {
+    for row in &rows {
         for (column, cell) in row.iter().enumerate() {
             if column > 0 {
                 out.push_str("  ");
@@ -180,6 +234,24 @@ pub fn format_rows(rows: &[Vec<String>], right: &[bool]) -> String {
             }
         }
         out.push('\n');
+    }
+    out
+}
+
+/// A value on one line: line breaks and tabs become visible escapes. For host data that
+/// is placed in a table cell or on a line of the tool's own.
+pub fn one_line_cell(text: &str) -> String {
+    if !text.contains(['\n', '\r', '\t']) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
     }
     out
 }
@@ -225,6 +297,16 @@ fn built_in_tools() -> Vec<Tool> {
     tools.extend(container::tools());
     tools.extend(cluster::tools());
     tools.extend(nrpe::tools());
+    tools.extend(net::tools());
+    tools.extend(tls::tools());
+    tools.extend(package::tools());
+    tools.extend(reboot::tools());
+    tools.extend(storage::tools());
+    tools.extend(triage::tools());
+    tools.extend(users::tools());
+    tools.extend(timesync::tools());
+    tools.extend(schedule::tools());
+    tools.extend(checks::tools());
     tools
 }
 
@@ -385,6 +467,30 @@ pub mod testing {
         }
     }
 
+    /// Creates an executable script for a test to run.
+    ///
+    /// AIDEV-NOTE: the file is written by a child process, never by this one. If this
+    /// process held it open for writing, a test thread that forked at that moment would
+    /// inherit the descriptor, and running the script would fail with "Text file busy"
+    /// until that other child had exec'ed. That made tests fail at random under load.
+    pub fn write_executable(path: &std::path::Path, content: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success(), "writing {path:?}");
+    }
+
     /// Stand-ins for system commands (systemctl, journalctl...): small scripts that record
     /// the arguments they were run with and print canned output. Tests use them to check
     /// exactly what a tool would run, and that it runs nothing when it should not.
@@ -414,16 +520,13 @@ pub mod testing {
         /// Adds a command whose behaviour is the shell fragment `body` (it sees the
         /// arguments as "$@"). Its arguments are recorded before `body` runs.
         pub fn add_script(mut self, name: &str, body: &str) -> FakeBins {
-            use std::os::unix::fs::PermissionsExt;
             let dir = self.dir.path().display().to_string();
             let script = format!(
                 "#!/bin/sh\n\
                  {{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; printf -- '--END--\\n'; }} >> '{dir}/{name}.calls'\n\
                  {body}\n"
             );
-            let path = format!("{dir}/{name}");
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(std::path::Path::new(&format!("{dir}/{name}")), &script);
             self.names.push(name.to_string());
             self
         }
@@ -487,6 +590,7 @@ pub mod testing {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     const CONFIG: &str = r#"
 [roles.operator]
@@ -551,6 +655,46 @@ roles = ["operator"]
         assert!(matches!(scoped.authorize(None), Err(ToolError::Denied(_))));
         let unscoped = testing::ctx(&host, "olivia", "service.view", Access::Read);
         assert!(unscoped.authorize(None).is_ok());
+    }
+
+    #[test]
+    fn permits_answers_for_one_resource_without_writing_an_audit_record() {
+        let (host, sink) = testing::host(CONFIG);
+        let ctx = testing::ctx(&host, "olivia", "service.control", Access::Write);
+        assert!(ctx.permits("nginx.service"));
+        assert!(!ctx.permits("postgresql.service"));
+        assert_eq!(sink.records().len(), 0);
+    }
+
+    #[test]
+    fn permits_respects_a_deny() {
+        let config = "[roles.r]\nallow = [\"fs.view\"]\ndeny = [\"fs.view:/srv/secret/**\"]\n\
+                      [unix_users.rita]\nroles = [\"r\"]\n";
+        let (host, _sink) = testing::host(config);
+        let ctx = testing::ctx(&host, "rita", "fs.view", Access::Read);
+        assert!(ctx.permits("/srv/www/"));
+        assert!(!ctx.permits("/srv/secret/keys/"));
+    }
+
+    #[test]
+    fn holds_read_is_true_only_for_another_read_permission_granted_in_full() {
+        let config = "[roles.r]\nallow = [\"system.view\", \"process.view\", \"journal.view:nginx.service\", \"service.control\"]\n\
+                      deny = [\"service.view:secret.service\"]\n\
+                      [roles.all]\nallow = [\"@read\"]\n\
+                      [unix_users.rita]\nroles = [\"r\"]\n\
+                      [unix_users.ann]\nroles = [\"all\", \"r\"]\n";
+        let (host, sink) = testing::host(config);
+        let ctx = testing::ctx(&host, "rita", "system.view", Access::Read);
+        assert!(ctx.holds_read("process.view"));
+        // granted for one unit only: not held in full
+        assert!(!ctx.holds_read("journal.view"));
+        // not granted at all
+        assert!(!ctx.holds_read("net.view"));
+        // @read grants it, but a scoped deny means it is not held in full
+        let ann = testing::ctx(&host, "ann", "system.view", Access::Read);
+        assert!(ann.holds_read("net.view"));
+        assert!(!ann.holds_read("service.view"));
+        assert_eq!(sink.records().len(), 0);
     }
 
     #[test]
@@ -619,6 +763,64 @@ roles = ["operator"]
         assert_eq!(
             format_table(&["NAME", "SIZE"], &rows, &[false, true]),
             "NAME       SIZE\na            10\nlong-name     5\n"
+        );
+    }
+
+    #[test]
+    fn a_call_clock_gives_each_command_what_is_left_of_the_call() {
+        let config =
+            format!("{CONFIG}\n[limits]\ncall_timeout_secs = 40\ncommand_timeout_secs = 5\n");
+        let (host, _sink) = testing::host(&config);
+        let ctx = testing::ctx(&host, "olivia", "service.view", Access::Read);
+        // plenty of the call left: the usual limit for one command
+        let clock = CallClock::start(&ctx);
+        assert_eq!(clock.next(), Some(Duration::from_secs(5)));
+        // less than a command's limit left: only what is left
+        let short = CallClock {
+            deadline: Instant::now() + Duration::from_millis(2500),
+            command: Duration::from_secs(5),
+        };
+        let limit = short.next().unwrap();
+        assert!(
+            limit <= Duration::from_millis(2500) && limit >= Duration::from_secs(2),
+            "{limit:?}"
+        );
+        // nothing worth starting a command for
+        let spent = CallClock {
+            deadline: Instant::now() + Duration::from_millis(300),
+            command: Duration::from_secs(5),
+        };
+        assert_eq!(spent.next(), None);
+    }
+
+    #[test]
+    fn a_call_clock_always_keeps_time_back_for_sending_the_answer() {
+        for (call, command) in [(120, 30), (30, 30), (4, 4), (1, 1)] {
+            let config = format!(
+                "{CONFIG}\n[limits]\ncall_timeout_secs = {call}\ncommand_timeout_secs = {command}\n"
+            );
+            let (host, _sink) = testing::host(&config);
+            let ctx = testing::ctx(&host, "olivia", "service.view", Access::Read);
+            let clock = CallClock::start(&ctx);
+            let left = clock.deadline.saturating_duration_since(Instant::now());
+            assert!(
+                left < Duration::from_secs(call),
+                "call {call}: {left:?} is the whole call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_cell_cannot_start_a_line_of_its_own() {
+        // AIDEV-NOTE: cells hold host data (a process's arguments, a file's name). A line
+        // break inside one would let that data add rows that look like the tool's own.
+        let rows = vec![
+            vec!["1".to_string(), "sleep\n9999 root 99.9 forged".to_string()],
+            vec!["2".to_string(), "a\tb\rc".to_string()],
+        ];
+        assert_eq!(
+            format_table(&["PID", "COMMAND"], &rows, &[true, false]),
+            "PID  COMMAND\n  1  sleep\\n9999 root 99.9 forged\n  2  a\\tb\\rc\n"
         );
     }
 
@@ -731,36 +933,54 @@ roles = ["operator"]
         assert_eq!(
             names(&registry),
             [
+                "block_devices",
                 "cluster_maintenance_mode",
                 "cluster_node",
                 "cluster_resource",
                 "cluster_status",
+                "config_validate",
                 "container_control",
                 "container_inspect",
                 "container_list",
                 "container_logs",
                 "container_stats",
                 "corosync_status",
+                "crash_events",
+                "disk_health",
+                "disk_hogs",
                 "disk_io",
                 "disk_usage",
                 "firewall_reset_counters",
                 "fs_list",
                 "fs_read",
                 "fs_stat",
+                "host_reboot",
+                "incident_snapshot",
                 "iptables_list",
                 "iptables_rule",
                 "journal_query",
                 "kernel_log",
                 "log_list",
                 "log_read",
+                "log_summary",
                 "memory_info",
+                "net_interfaces",
+                "net_probe",
+                "net_routes",
+                "net_sockets",
                 "nft_list",
                 "nft_rule",
                 "nrpe_check",
                 "nrpe_list",
+                "package_query",
+                "package_updates",
+                "package_upgrade",
+                "packet_capture",
                 "process_info",
                 "process_list",
                 "process_signal",
+                "resource_top",
+                "scheduled_jobs",
                 "service_control",
                 "service_enable",
                 "service_list",
@@ -769,6 +989,10 @@ roles = ["operator"]
                 "sysctl_set",
                 "sysfs_set",
                 "system_info",
+                "time_sync_status",
+                "tls_cert_check",
+                "user_list",
+                "user_modify",
             ]
         );
     }
@@ -781,30 +1005,44 @@ roles = ["operator"]
         let (registry, _) = built("").unwrap();
         let read = [
             "cluster.view",
+            "config.validate",
             "container.logs",
             "container.view",
+            "crash.view",
             "firewall.view",
             "fs.read",
             "fs.view",
             "journal.view",
             "kernel_log.view",
             "logs.view",
+            "net.probe",
+            "net.view",
             "nrpe.run",
             "nrpe.view",
+            "package.view",
             "process.view",
+            "schedule.view",
             "service.view",
+            "storage.view",
             "sysctl.view",
             "system.view",
+            "time.view",
+            "tls.view",
+            "user.view",
         ];
         let write = [
             "cluster.modify",
             "container.control",
             "firewall.modify",
+            "host.reboot",
+            "net.capture",
+            "package.modify",
             "process.signal",
             "service.control",
             "service.enable",
             "sysctl.modify",
             "sysfs.modify",
+            "user.modify",
         ];
         let mut want: Vec<(String, Access)> = read
             .iter()
@@ -833,6 +1071,32 @@ roles = ["operator"]
                 );
             }
         }
+    }
+
+    /// AIDEV-NOTE: an async function's local state lives in its future, and a future
+    /// that awaits others holds theirs too. One tool reached 219 KiB that way and
+    /// overflowed a 2 MiB thread stack in a debug build (the future is built on the stack
+    /// before it is boxed, and each level of nesting copies it again). Parts that run
+    /// side by side or are large should be boxed (`Box::pin`); this keeps every tool's
+    /// future small enough that it cannot happen again unnoticed.
+    #[test]
+    fn no_tool_has_a_future_large_enough_to_threaten_the_stack() {
+        const LIMIT: usize = 32 * 1024;
+        let (host, _sink) =
+            testing::host("[roles.r]\nallow = [\"@all\"]\n[unix_users.u]\nroles = [\"r\"]\n");
+        let mut sizes = Vec::new();
+        for tool in built_in_tools() {
+            let ctx = testing::ctx(&host, "u", &tool.permission, tool.access);
+            // Creating the future runs nothing: an async function starts when first polled.
+            let future = (tool.handler)(ctx, Args::default());
+            sizes.push((std::mem::size_of_val(&*future), tool.name.clone()));
+        }
+        sizes.sort();
+        let too_large: Vec<_> = sizes.iter().filter(|(size, _)| *size > LIMIT).collect();
+        assert!(
+            too_large.is_empty(),
+            "futures over {LIMIT} bytes: {too_large:?}"
+        );
     }
 
     #[test]

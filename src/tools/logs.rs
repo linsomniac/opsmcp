@@ -99,7 +99,7 @@ pub fn tools() -> Vec<Tool> {
 }
 
 /// Syslog severities, most severe first; the index is the numeric level.
-const LEVELS: [&str; 8] = [
+pub(super) const LEVELS: [&str; 8] = [
     "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
 ];
 

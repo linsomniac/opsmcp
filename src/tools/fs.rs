@@ -415,6 +415,10 @@ async fn fs_list(ctx: Ctx, args: Args) -> ToolResult {
             &ctx.cfg().fs.list_roots,
             "fs.list_roots",
         )?;
+        // AIDEV-NOTE: the caller's grant is checked BEFORE saying what kind of thing the
+        // path is. Otherwise "that is a file, not a directory" would tell a caller about
+        // paths its grant does not cover.
+        let auth = ctx.authorize(Some(&resource))?;
         if !opened.meta.is_dir() {
             return Err(ToolError::Invalid(format!(
                 "{} is a {}, not a directory",
@@ -422,7 +426,6 @@ async fn fs_list(ctx: Ctx, args: Args) -> ToolResult {
                 kind_name(&opened.meta)
             )));
         }
-        let auth = ctx.authorize(Some(&resource))?;
         auth.ok(list_directory(&opened, limit)?)
     })
     .await
@@ -744,10 +747,14 @@ mod tests {
 allow = ["@read"]
 [roles.narrow]
 allow = ["fs.view", "fs.read:{root}/public/**"]
+[roles.scoped]
+allow = ["fs.view:{root}/public/**"]
 [unix_users.rita]
 roles = ["reader"]
 [unix_users.nora]
 roles = ["narrow"]
+[unix_users.sam]
+roles = ["scoped"]
 [fs]
 list_roots = ["{root}"]
 read_roots = ["{root}"]
@@ -1077,6 +1084,33 @@ read_roots = ["{root}"]
         );
         assert!(!text.contains("server.key"), "{text}");
         assert!(text.contains("3 more"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn fs_list_does_not_say_what_a_path_outside_the_callers_grant_is() {
+        let t = tree();
+        // sam may only look under public/. Asked about a file elsewhere, the answer is a
+        // refusal, not "that is a file": what kind of thing it is is not sam's to learn.
+        let message = denied(
+            t.run("sam", "fs_list", json!({"path": t.path("blob.bin")}))
+                .await,
+        );
+        assert!(message.contains("fs.view"), "{message}");
+        assert_eq!(t.last_decision()["decision"], "deny");
+        // inside the grant, the caller is told why a file cannot be listed
+        match t
+            .run(
+                "sam",
+                "fs_list",
+                json!({"path": t.path("public/hello.txt")}),
+            )
+            .await
+        {
+            Err(ToolError::Invalid(message)) => {
+                assert!(message.contains("not a directory"), "{message}")
+            }
+            other => panic!("expected an invalid-argument error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -200,16 +200,14 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::policy::Access;
-    use crate::tools::testing::{call, host, host_with_trust, ok_text};
+    use crate::tools::testing::{call, host, host_with_trust, ok_text, write_executable};
     use serde_json::{Value as Json, json};
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     /// A script that prints each of its arguments on its own line, then `$EXTRA`.
     fn script(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path.to_string_lossy().into_owned()
     }
 

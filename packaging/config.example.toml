@@ -34,8 +34,14 @@ allow = [
     "service.control:nginx.service",
     "service.control:haproxy.service",
     "container.control:web-*",
+    "package.modify:nginx*", # upgrade these packages, nothing else
     "custom.haproxy_set",
 ]
+
+# For the people on call: lock an account, look at traffic. (@read does not include
+# packet_capture: it is tagged write so that reading traffic is always granted by name.)
+[roles.incident]
+allow = ["@read", "user.modify", "net.capture:eth*"]
 
 [roles.admin]
 allow = ["@all"]
@@ -132,6 +138,22 @@ protected = [
     "dbus-broker.service",
     "opsmcp*",
 ]
+
+[net]
+# Hosts that net_probe and tls_cert_check may connect to. Empty: none. A target is
+# matched as a name in lower case, or as an address in its usual form (::ffff:10.0.0.5
+# counts as 10.0.0.5). A name is matched as a name: what it resolves to is not checked.
+probe_targets = ["10.*", "*.example.com", "localhost"]
+# Interfaces packet_capture may listen on. Empty: no capture at all.
+capture_interfaces = ["eth*"]
+capture_payload = false # true: packet contents may be shown, not only headers
+
+[users]
+# What user_modify may change. Uid 0 can never be modified.
+min_uid = 1000        # accounts below this uid are off limits
+protected = ["root"]  # account names (globs) that are off limits
+groups = ["www-data"] # groups whose membership may be changed (exact names). Empty: none
+manage_ssh_keys = false # true: keys may be added to and removed from authorized_keys
 
 [tools]
 # Built-in tools to switch off entirely on this host.

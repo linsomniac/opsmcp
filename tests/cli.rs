@@ -89,7 +89,7 @@ fn check_config_accepts_a_valid_configuration_and_summarises_it() {
         .lines()
         .find(|l| l.trim_start().starts_with("admin"))
         .expect(&stdout);
-    assert!(admin.contains("38 tools"), "{admin}");
+    assert!(admin.contains("60 tools"), "{admin}");
     assert!(stdout.contains(&me()), "{stdout}");
 }
 

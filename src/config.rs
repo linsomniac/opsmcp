@@ -40,6 +40,8 @@ pub struct Config {
     pub kernel: KernelCfg,
     pub services: ServicesCfg,
     pub nrpe: NrpeCfg,
+    pub net: NetCfg,
+    pub users: UsersCfg,
     /// Operator-defined tools, by tool name.
     pub custom: BTreeMap<String, CustomCfg>,
 }
@@ -291,6 +293,50 @@ impl Default for ServicesCfg {
 pub struct NrpeCfg {
     /// Path of nrpe.cfg. Unset: the usual locations are tried.
     pub config: Option<PathBuf>,
+}
+
+/// Limits on the tools that send or capture network traffic. Both are off until the
+/// operator says where they may be used.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetCfg {
+    /// Globs over the hosts that net_probe and tls_cert_check may connect to, matched
+    /// against the target in its one standard form: a name in lower case without a
+    /// trailing dot, or an address as it is normally written (an IPv4-mapped IPv6
+    /// address counts as the IPv4 address). What a name resolves to is not checked.
+    /// Empty by default: nothing may be probed.
+    pub probe_targets: Vec<String>,
+    /// Globs over the interfaces packet_capture may listen on. Empty by default: no
+    /// capture.
+    pub capture_interfaces: Vec<String>,
+    /// Let packet_capture return packet contents as well as headers.
+    pub capture_payload: bool,
+}
+
+/// Limits on what user_modify may change, whatever a role grants.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UsersCfg {
+    /// Accounts with a uid below this cannot be modified (system accounts). Uid 0 can
+    /// never be modified.
+    pub min_uid: u32,
+    /// Globs over account names that can never be modified.
+    pub protected: Vec<String>,
+    /// The groups whose membership may be changed, by exact name. Empty by default: none.
+    pub groups: Vec<String>,
+    /// Allow adding and removing keys in users' authorized_keys files.
+    pub manage_ssh_keys: bool,
+}
+
+impl Default for UsersCfg {
+    fn default() -> Self {
+        UsersCfg {
+            min_uid: 1000,
+            protected: vec!["root".to_string()],
+            groups: Vec::new(),
+            manage_ssh_keys: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,6 +639,29 @@ impl Config {
         if self.services.protected.iter().any(String::is_empty) {
             errs.push("services.protected: contains an empty pattern".to_string());
         }
+        if self.net.probe_targets.iter().any(String::is_empty) {
+            errs.push("net.probe_targets: contains an empty pattern".to_string());
+        }
+        if self.net.capture_interfaces.iter().any(String::is_empty) {
+            errs.push("net.capture_interfaces: contains an empty pattern".to_string());
+        }
+        check_range(
+            "users.min_uid",
+            u64::from(self.users.min_uid),
+            1,
+            u64::from(u32::MAX),
+            &mut errs,
+        );
+        if self.users.protected.iter().any(String::is_empty) {
+            errs.push("users.protected: contains an empty pattern".to_string());
+        }
+        for group in &self.users.groups {
+            if !is_account_name(group) {
+                errs.push(format!(
+                    "users.groups: {group:?} is not a group name (these are exact names, not patterns)"
+                ));
+            }
+        }
 
         for (name, custom) in &self.custom {
             validate_custom(name, custom, limits.call_timeout_secs, &mut errs);
@@ -756,6 +825,18 @@ fn is_identifier(name: &str, max: usize) -> bool {
     name.len() <= max
         && chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A user or group name as the account tools accept it: letters, digits and `_ . -`
+/// (and a final `$`), not starting with `-` or `.`, at most 32 characters.
+pub fn is_account_name(name: &str) -> bool {
+    let body = name.strip_suffix('$').unwrap_or(name);
+    !body.is_empty()
+        && name.len() <= 32
+        && !body.starts_with(['-', '.'])
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
 }
 
 fn check_absolute(at: &str, path: &Path, errs: &mut Vec<String>) {
@@ -1073,6 +1154,38 @@ tls_key = "/etc/opsmcp/tls/server.key"
         assert_one_error_mentions("[logs]\ndirs = [\"var/log\"]\n", &["var/log"]);
         assert_one_error_mentions("[fs]\nread_roots = [\"etc\"]\n", &["etc"]);
         assert_one_error_mentions("[paths]\nsearch = [\"bin\"]\n", &["bin"]);
+    }
+
+    #[test]
+    fn network_and_account_tools_allow_nothing_until_configured() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.net.probe_targets.is_empty());
+        assert!(cfg.net.capture_interfaces.is_empty());
+        assert!(!cfg.net.capture_payload);
+        assert_eq!(cfg.users.min_uid, 1000);
+        assert_eq!(cfg.users.protected, ["root"]);
+        assert!(cfg.users.groups.is_empty());
+        assert!(!cfg.users.manage_ssh_keys);
+    }
+
+    #[test]
+    fn network_and_account_settings_are_checked() {
+        assert_one_error_mentions("[net]\nprobe_targets = [\"\"]\n", &["net.probe_targets"]);
+        assert_one_error_mentions(
+            "[net]\ncapture_interfaces = [\"\"]\n",
+            &["net.capture_interfaces"],
+        );
+        assert_one_error_mentions("[users]\nmin_uid = 0\n", &["users.min_uid"]);
+        assert_one_error_mentions("[users]\nprotected = [\"\"]\n", &["users.protected"]);
+        assert_one_error_mentions(
+            "[users]\ngroups = [\"www data\"]\n",
+            &["users.groups", "www data"],
+        );
+        assert_one_error_mentions("[users]\ngroups = [\"-x\"]\n", &["users.groups"]);
+        let ok = "[net]\nprobe_targets = [\"10.*\", \"*.example.com\"]\ncapture_interfaces = [\"eth*\"]\n\
+                  capture_payload = true\n[users]\nmin_uid = 500\nprotected = [\"root\", \"deploy*\"]\n\
+                  groups = [\"www-data\", \"dev.team\"]\nmanage_ssh_keys = true\n";
+        assert_eq!(errors(ok), Vec::<String>::new());
     }
 
     fn custom(body: &str) -> String {

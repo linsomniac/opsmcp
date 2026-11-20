@@ -258,6 +258,21 @@ impl Bins {
 
     /// The absolute path of a command, by bare name.
     pub fn find(&self, name: &str) -> Result<PathBuf, String> {
+        self.lookup(name)?.ok_or_else(|| {
+            format!(
+                "the `{name}` command is not installed on this host (looked in {})",
+                self.path_env()
+            )
+        })
+    }
+
+    /// Like `find`, but tells apart a command that is not installed (`Ok(None)`) from
+    /// one that is there and may not be run (`Err`).
+    ///
+    /// AIDEV-NOTE: use this, not `find(..).is_err()`, wherever "the program is absent"
+    /// is taken to mean something (no cluster on this host, say). A program that fails
+    /// the trust check is not absent, and treating it as absent would fail open.
+    pub fn lookup(&self, name: &str) -> Result<Option<PathBuf>, String> {
         if name.is_empty() || name.starts_with('.') || name.contains('/') {
             return Err(format!("{name:?} is not a bare command name"));
         }
@@ -269,20 +284,17 @@ impl Bins {
                 ));
             }
             self.check_program(path)?;
-            return Ok(path.clone());
+            return Ok(Some(path.clone()));
         }
         for dir in &self.search {
             let candidate = dir.join(name);
             if is_executable_file(&candidate) {
                 // Fail closed: an untrusted match is an error, not a reason to look further.
                 self.check_program(&candidate)?;
-                return Ok(candidate);
+                return Ok(Some(candidate));
             }
         }
-        Err(format!(
-            "the `{name}` command is not installed on this host (looked in {})",
-            self.path_env()
-        ))
+        Ok(None)
     }
 
     /// Like `find`, but for an operator-configured absolute path.
@@ -445,7 +457,9 @@ mod tests {
     #[tokio::test]
     async fn the_time_limit_kills_the_whole_process_group() {
         let started = Instant::now();
-        let cmd = sh("sleep 30 & echo $!; wait").timeout(Duration::from_millis(300));
+        // AIDEV-NOTE: the limit must leave the shell time to start and print the pid even
+        // on a busy machine; at 300 ms this test failed now and then under load.
+        let cmd = sh("sleep 30 & echo $!; wait").timeout(Duration::from_millis(1500));
         let out = run(cmd).await.unwrap();
         assert!(out.timed_out);
         assert_eq!(out.code, None);
@@ -494,6 +508,26 @@ mod tests {
         std::fs::write(&path, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
+    }
+
+    #[test]
+    fn lookup_tells_a_missing_program_from_one_that_may_not_be_run() {
+        let dir = tempfile::tempdir().unwrap();
+        make_file(dir.path(), "present", 0o755);
+        let paths = PathsCfg {
+            search: vec![dir.path().to_path_buf()],
+            bin: BTreeMap::new(),
+        };
+        let any = Bins::new(&paths, None);
+        assert_eq!(any.lookup("absent"), Ok(None));
+        assert_eq!(any.lookup("present"), Ok(Some(dir.path().join("present"))));
+        // owned by the user running the tests, not by root: not trusted
+        if rustix::process::getuid().as_raw() != 0 {
+            let strict = Bins::new(&paths, Some(Vec::new()));
+            assert!(strict.lookup("present").is_err());
+            assert_eq!(strict.lookup("absent"), Ok(None));
+        }
+        assert!(any.lookup("../bin/sh").is_err());
     }
 
     fn me() -> u32 {

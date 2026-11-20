@@ -2,16 +2,21 @@
 
 An [MCP](https://modelcontextprotocol.io) server that lets AI agents such as Claude Code
 do operations work on a Linux host: look at processes, memory, disks, logs, services,
-firewall rules, kernel settings, containers and a Pacemaker cluster, run your NRPE
-checks, make a controlled set of changes, and run commands you define.
+the network, firewall rules, kernel settings, packages, accounts, containers and a
+Pacemaker cluster, run your NRPE checks, make a controlled set of changes, and run
+commands you define.
 
 Every call is checked against the caller's roles and written to an audit trail. Nothing
 is allowed unless the configuration grants it.
 
-Status: 0.1, a first complete cut. It has an extensive test suite and has had two
-independent reviews (security, and robustness); what they found was fixed, apart from
-the few points recorded under [Security model](#security-model) and
-[Not included yet](#not-included-yet). It has not yet run in production.
+Status: 0.1, a first complete cut. It has an extensive test suite, and both the
+original tools and the ones added since (network, packages, storage, triage, accounts)
+have each had two independent reviews; what they found was fixed, apart from the few
+points recorded under [Security model](#security-model) and
+[Not included yet](#not-included-yet). Much of it has only been exercised against
+stand-in commands: dpkg/apt, rpm/dnf, smartctl, LVM, Pacemaker, chrony and the tools
+that change things have not been run against the real thing. It has not yet run in
+production.
 
 ## Contents
 
@@ -153,11 +158,19 @@ roles = ["web-operator"]
 ```
 
 Separately from roles, the configuration sets **host-wide limits** that apply to
-everyone, administrators included: which directories can be read (`fs.read_roots`,
-empty by default), which paths never can (`fs.deny`, on top of a built-in list of
-password files, private keys and credentials), which sysctls and `/sys` files can be
-changed (`kernel.writable_*`, empty by default), and which units are protected
-(`services.protected`).
+everyone, administrators included:
+
+| Setting | What it limits | Default |
+| --- | --- | --- |
+| `fs.read_roots` | directories whose files can be read | none |
+| `fs.deny` | paths that can never be listed or read, on top of a built-in list of password files, private keys and credentials | built-in list |
+| `kernel.writable_sysctls`, `kernel.writable_sysfs` | sysctls and `/sys` files that can be changed | none |
+| `services.protected` | units that cannot be controlled | journald, logind, udevd, dbus, opsmcp |
+| `net.probe_targets` | hosts that `net_probe` and `tls_cert_check` may connect to | none |
+| `net.capture_interfaces`, `net.capture_payload` | where `packet_capture` may listen, and whether it may show packet contents | none, no |
+| `users.min_uid`, `users.protected` | accounts `user_modify` may not touch (uid 0 never) | below 1000, `root` |
+| `users.groups` | groups whose membership `user_modify` may change | none |
+| `users.manage_ssh_keys` | whether `user_modify` may edit `authorized_keys` | no |
 
 ## Tools
 
@@ -196,6 +209,24 @@ The "resource" column is what a grant's part after the colon is matched against.
 | `cluster_maintenance_mode` | write | `cluster.modify` | `property/maintenance-mode` |
 | `nrpe_list` | read | `nrpe.view` | |
 | `nrpe_check` | read | `nrpe.run` | check name |
+| `net_interfaces`, `net_routes`, `net_sockets` | read | `net.view` | |
+| `net_probe` | read | `net.probe` | target host (name in lower case, or address) |
+| `packet_capture` | write | `net.capture` | interface |
+| `tls_cert_check` | read | `tls.view` | file path, or host |
+| `package_query`, `package_updates` | read | `package.view` | |
+| `package_upgrade` | write | `package.modify` | package name |
+| `host_reboot` | write | `host.reboot` | |
+| `block_devices`, `disk_health` | read | `storage.view` | |
+| `disk_hogs` | read | `fs.view` | directory, with a trailing `/` |
+| `resource_top` | read | `process.view` | |
+| `crash_events` | read | `crash.view` | |
+| `log_summary` | read | `journal.view` | unit, when the summary is for one unit |
+| `incident_snapshot` | read | `system.view` | |
+| `time_sync_status` | read | `time.view` | |
+| `scheduled_jobs` | read | `schedule.view` | |
+| `user_list` | read | `user.view` | user, when one is named |
+| `user_modify` | write | `user.modify` | user |
+| `config_validate` | read | `config.validate` | check name, e.g. `nginx` |
 | custom tools | as configured | `custom.NAME` | |
 
 Paths are always judged by where they really are, after links are resolved. A link in
@@ -212,6 +243,91 @@ checks with `nrpe.run:check_load`.
 
 Changes to the firewall, sysctls and `/sys` affect the running system only. They are not
 saved, and a reboot brings the configured state back.
+
+### Notes on particular tools
+
+**Reaching other hosts.** `net_probe`, and `tls_cert_check` when given a host, make this
+host connect somewhere else, so both are limited to `net.probe_targets` for everyone.
+A target is a host name or an address, written out in full: forms such as `127.1` or
+`2130706433`, which resolvers read as addresses, are refused. Patterns and grants are
+matched against its one standard form: a name in lower case, or an address as it is
+normally written (`::ffff:10.0.0.5` counts as `10.0.0.5`). A name is matched as a
+name, and what it resolves to is not checked again, so a pattern or a grant for a
+name covers whatever this host's resolver says that name is. `net_probe` reports
+reachability only: a TCP probe connects and hangs up without sending anything.
+
+**Capturing traffic.** `packet_capture` changes nothing, but it is tagged write so that
+`@read` never includes reading other people's traffic; grant `net.capture` by name. It
+listens only on `net.capture_interfaces`, without promiscuous mode, for at most 30
+seconds and 1000 packets. Each packet is one line of time, addresses, ports, protocol
+and length, and the contents are not even captured; TCP flags, decoded protocol
+detail and contents appear only with `payload`, which needs `net.capture_payload`.
+The filter is a tcpdump expression (it can still select on flags, such as resets);
+tcpdump options are not accepted.
+
+**Certificates.** `tls_cert_check` describes the certificates in a file, or the ones a
+server presents, with a one-line verdict first (expired, expires soon, wrong name, not
+trusted by this host's CA bundle; `UNVERIFIED` rather than `OK` when there is no CA
+bundle to check against). A file is subject to the same limits as `fs_list`,
+so it cannot be pointed at a private key; only certificate details are ever returned.
+
+**Packages.** `package_query` and `package_updates` work on dpkg/apt and rpm/dnf hosts
+and never refresh the package lists. `package_upgrade` upgrades packages that are
+already installed and may bring in new dependencies (a new kernel, for instance). On
+apt hosts it never removes a package, so an update that would need one removed stays
+pending, and it keeps locally changed configuration files. On dnf hosts dnf's own
+upgrade rules apply: an obsoleted package can be replaced and old kernels removed.
+A real run is started as a systemd unit of its
+own (`opsmcp-pkg-...`), so it is not cut off half way if it outlasts the call; the
+result then names the unit to follow. A grant such as `package.modify:nginx*` limits
+it to those packages; upgrading everything, or only refreshing the lists, needs the
+permission without a resource.
+
+**Rebooting.** `host_reboot` only reboots (never powers off), one minute ahead by
+default so that it can be cancelled, and warns logged-in users. On a Pacemaker node it
+refuses unless the node is offline, or in standby with its resources gone; maintenance
+mode does not count, because resources keep running there. It also refuses when it
+cannot tell (the cluster does not answer, or `crm_mon` fails for any reason other
+than no cluster running), and on a cluster node the reboot must be within ten minutes
+of that check. `force` overrides all of this.
+
+**Disk space.** `disk_hogs` adds up a directory tree itself: one filesystem, no links
+followed, stopping at the time limit with what it has (unfinished directories are
+marked `>=`). Everything under the directory counts towards its totals, but only
+paths the caller could list with `fs_list` are named. It also lists deleted files
+that a process still holds open, which is space `du` cannot see; which process holds
+them is shown only to a caller who also has `process.view`.
+
+**One-call triage.** `incident_snapshot` gathers load, memory, full filesystems, top
+processes, failed units, recent errors, crashes and interface errors. Each part is
+included only if the caller holds the permission of the tool it comes from
+(`process.view` for the processes, `journal.view` for the errors, and so on), so it
+never shows more than the caller could have asked for piece by piece. The same holds
+for the per-unit figures in `resource_top`, which need `service.view`.
+
+**Log summaries.** `log_summary` counts journal entries by source and groups repeated
+messages. A source is the systemd unit an entry came from; an entry from no unit is
+filed under the name its sender gave itself and marked `(syslog id)`, because any
+local user can pick that name.
+
+**Scheduled jobs.** `scheduled_jobs` lists systemd timers with how each unit's last
+run ended, and every crontab on the host, including users' own. Scripts and files
+that cron would skip (not executable, or a name such as `job.dpkg-old`) are marked.
+Cron lines often carry passwords. They are masked on the same best-effort basis as
+process command lines, so treat `schedule.view` like `process.view`.
+
+**Accounts.** `user_list` and `user_modify` see the accounts in `/etc/passwd`; accounts
+that exist only in LDAP or sssd are not shown and cannot be changed. `user_modify` can
+lock and unlock an account, change membership of the groups in `users.groups`, and,
+with `users.manage_ssh_keys`, add or remove keys in `authorized_keys`. Locking refuses
+password and key logins alike but does not end sessions that are already running.
+Unlocking undoes only that: an expiry date someone set on the account is left as it
+is. A key to be added must be a complete key of its type, with no options in front.
+Password hashes are never shown; only whether a password is set or locked.
+
+**Checking configuration.** `config_validate` runs a service's own check (`nginx -t`,
+`haproxy -c`, `sshd -t`, `visudo -c` and others) with fixed arguments. Checks for
+other services can be added as custom tools.
 
 ## Custom tools
 
@@ -291,16 +407,28 @@ link is the file itself: no path check can tell.
 **What agents see.** Tool output is host data that other parties can influence: a log
 line can contain text written to look like instructions. opsmcp cannot make that
 trustworthy. It does remove terminal escape sequences and invisible or
-direction-changing characters, so that what the agent and a human reviewer see is what
-is there, and it tells the agent to treat output as data. Secrets in process command
-lines and container definitions are masked on a best-effort basis; container environment
-values are always hidden and process environments are never shown. Do not rely on the
-masking: grant `@read` only to callers you would let read your process list and logs.
+direction-changing characters (including the tag characters and variation selectors
+that can carry text nobody sees), so that what the agent and a human reviewer see is
+what is there; a value in a table cannot break out of its cell to add lines of its
+own; and it tells the agent to treat output as data. Secrets in process command lines,
+cron lines and container definitions are masked on a best-effort basis: options and
+variables whose names say they are secrets, `user:password` forms, secret HTTP
+headers, and the password options of the MySQL tools and sshpass. Container
+environment values are always hidden and process environments are never shown. Do not
+rely on the masking: grant `@read` only to callers you would let read your process
+list, crontabs and logs.
+
+**Writing in a user's home directory.** When `user_modify` edits `authorized_keys`
+it is root working in a directory the user controls. It never follows a symbolic link
+there, never writes to a file that has a second hard link, does every step through
+open directory handles rather than by path, and replaces the file with a new one that
+keeps the old one's owner and permissions.
 
 **What it does not protect against.** A caller with broad write grants is as powerful as
-those grants: unscoped `firewall.modify` can cut the host off, and a custom tool is only
-as safe as the script behind it. Scope write grants to the units, chains and containers
-that are meant.
+those grants: unscoped `firewall.modify` can cut the host off, `user.modify` with key
+management on can let someone log in as another user, `host.reboot` can take the host
+down, and a custom tool is only as safe as the script behind it. Scope write grants to
+the units, chains, containers, packages and accounts that are meant.
 
 ## Audit trail
 
@@ -344,13 +472,13 @@ call's time limit has passed.
 
 - A safety net for firewall changes (automatic revert unless confirmed), which is the
   most valuable thing to add before granting `firewall.modify` widely.
-- Network views (interfaces, routes, listening sockets) and user management.
+- Creating and deleting accounts, and changing passwords.
 - Filtering collections item by item. A caller with a `deny` limited to one resource
   cannot use the "list everything" tools for that permission at all (rule 4 above).
 - Certificate revocation lists.
 - Reloading the configuration without a restart. The HTTPS server keeps no state, so a
   restart is cheap.
-- Packages (deb, rpm, Nix).
+- Installing or removing packages (only upgrades of installed ones), and Nix.
 
 ## Development
 
