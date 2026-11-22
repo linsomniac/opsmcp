@@ -347,16 +347,30 @@ Mutual TLS closes that, in three places:
 - **The fleet server has a client certificate** (`client_cert` and `client_key` under
   `[fleet.https]`). This is required: a configuration with a rule over HTTPS and no
   certificate is refused.
-- **The hosts ask for it**: `auth = "mtls+token"` under their `[http]`, with `client_ca`
-  naming what issued the fleet server's certificate. A token is then only good through
-  the fleet server, and the fleet server's certificate does nothing without a token. The
-  fleet server cannot see whether a host asks, so this half is yours to set.
+- **The hosts ask for it, and for no other**: `auth = "mtls+token"` under their `[http]`,
+  with `client_ca` naming the CA that issued the fleet server's certificate, and that
+  certificate listed:
 
-  In this mode a host takes a token with **any** certificate its `client_ca` issued, so
-  that must be the fleet server's certificate and nothing else. A CA that also issues
-  certificates to the hosts themselves would let any of them present a token it was sent.
-  The simplest way is a certificate that signs itself, named as `client_ca` on the hosts,
-  which then take that one certificate and no other (with OpenSSL 3):
+  ```toml
+  [http]
+  auth = "mtls+token"
+  client_ca = "/etc/opsmcp/tls/ca.crt"
+
+  [client_certs.bastion]
+  cn = "bastion1.example.com"     # or sha256 = "...", for that one certificate
+  ```
+
+  A token is then only good through the fleet server, and the fleet server's certificate
+  does nothing without a token. The fleet server cannot see whether a host asks, so this
+  half is yours to set.
+
+  The listing matters when the CA issues other certificates too, as one CA for
+  everything does: with nothing under `[client_certs]`, a host takes a token with **any**
+  certificate of that CA, so every machine holding one could present a token it was
+  sent. `check-config` on a host says which of the two is in effect. Listing by `cn`
+  relies on the CA never giving that name to anything else; `sha256` names one
+  certificate, and has to be changed when it is renewed. Without a CA at all, a
+  certificate that signs itself can be named as `client_ca` (with OpenSSL 3):
 
   ```sh
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 825 \
@@ -365,7 +379,9 @@ Mutual TLS closes that, in three places:
   ```
 - **The fleet server asks its own callers for one** when it passes their tokens on:
   `auth = "mtls+token"` under its own `[http]`, so that a host cannot present a token it
-  was sent to the fleet server. `check-config` warns when this is missing.
+  was sent to the fleet server. `check-config` warns when this is missing. If the callers'
+  certificates come from a CA that the hosts' certificates come from too, list the
+  callers' under `[client_certs]` here, for the same reason as on the hosts.
 
 The hosts' certificates are always verified, for the address in the inventory, before a
 token is sent; there is no option to skip that.
@@ -460,7 +476,7 @@ roles = ["staff"]
 
 [http]                    # callers show a certificate too: see Passing tokens on
 auth = "mtls+token"
-client_ca = "/etc/opsmcp/tls/people-ca.crt"
+client_ca = "/etc/opsmcp/tls/ca.crt"
 
 [[fleet.access]]
 name = "own-token"
@@ -470,7 +486,7 @@ via = "https"
 identity = "caller"
 
 [fleet.https]
-ca = "/etc/opsmcp/tls/hosts-ca.crt"
+ca = "/etc/opsmcp/tls/ca.crt"
 client_cert = "/etc/opsmcp/fleet/client.crt"
 client_key = "/etc/opsmcp/fleet/client.key"
 ```
@@ -486,7 +502,10 @@ roles = ["readonly"]
 
 [http]
 auth = "mtls+token"
-client_ca = "/etc/opsmcp/tls/fleet-client.crt"   # the bastion's client.crt, nothing wider
+client_ca = "/etc/opsmcp/tls/ca.crt"
+
+[client_certs.bastion]    # of all that CA issued, only the bastion's certificate
+cn = "bastion1.example.com"
 ```
 
 ### What changes with a fleet
@@ -1053,7 +1072,10 @@ unit's real name.
 **Client certificates.** A certificate is accepted while it verifies against
 `http.client_ca` and is listed; there is no CRL or OCSP check. To revoke one, remove its
 entry (or pin certificates by `sha256` rather than `cn`, so that a reissued certificate
-has to be listed anew) and restart.
+has to be listed anew) and restart. With `auth = "mtls+token"` the token is the caller
+and a certificate only lets it in: entries under `[client_certs]` then have no roles, and
+once there is one, a token is only taken with a listed certificate. With none, any
+certificate of the CA will do, which is only right for a CA that issues nothing else.
 
 **Host settings that matter.** `fs.protected_hardlinks` must be 1 (the default on every
 current distribution; opsmcp warns at startup if it is not). With it off, a local user

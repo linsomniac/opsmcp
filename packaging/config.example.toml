@@ -86,6 +86,10 @@ expires = "2027-12-31" # optional: the last day it is valid (UTC)
 
 # HTTPS: TLS client certificates issued by http.client_ca, matched by subject common
 # name (cn) or by the SHA-256 fingerprint of one exact certificate (sha256).
+# With http.auth = "mtls+token" a certificate is not a caller (the token is) and is
+# listed without roles; once any is listed, a token is only taken with a listed one:
+#   [client_certs.bastion]
+#   cn = "bastion1.example.com"
 [client_certs.sean-laptop]
 cn = "sean"
 roles = ["admin"]
@@ -101,7 +105,8 @@ client_ca = "/etc/opsmcp/tls/clients-ca.crt"
 # Who may connect:
 #   "token"          a bearer token (the default)
 #   "mtls"           a client certificate listed under [client_certs]
-#   "mtls+token"     any certificate from client_ca AND a bearer token
+#   "mtls+token"     a bearer token AND a certificate from client_ca: one listed under
+#                    [client_certs] if any is listed there, otherwise any that CA issued
 #   "mtls-or-token"  either
 auth = "mtls-or-token"
 # Browser origins allowed to call the server. Leave empty unless a web page needs to.

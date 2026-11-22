@@ -594,19 +594,29 @@ fn authenticate(shared: &Shared, conn: &Conn, headers: &HeaderMap) -> Result<Ses
     let outcome = match shared.auth {
         AuthMode::Token => by_token(),
         AuthMode::Mtls => by_cert(),
-        // The handshake has already required a certificate from the CA; this is a
-        // second check that it is there. The token then says who the caller is.
-        // AIDEV-NOTE: the certificate is NOT looked up under [client_certs] in this
-        // mode: any certificate `http.client_ca` issued counts. A host that takes
-        // tokens passed on by a fleet server therefore relies on that CA issuing the
-        // fleet server's certificate and nothing else (the README says how: a
-        // certificate that signs itself, named as `client_ca`). Checked against real
-        // servers on 2026-11-22: a second certificate from the same CA was accepted
-        // with a passed-on token.
-        AuthMode::MtlsAndToken if conn.client_cert.is_none() => {
-            Err((StatusCode::FORBIDDEN, "no client certificate"))
-        }
-        AuthMode::MtlsAndToken => by_token(),
+        // The handshake has already required a certificate from the CA; the token then
+        // says who the caller is.
+        // AIDEV-NOTE: once any certificate is listed under [client_certs], a token is
+        // only taken with a listed one. Without that, a token passed on by a fleet
+        // server could be presented by anything else holding a certificate of the same
+        // CA (seen against real servers on 2026-11-22), which is every host when there
+        // is one CA for everything. With none listed any certificate of the CA will do:
+        // see `Config::certificates_only_let_tokens_in`.
+        AuthMode::MtlsAndToken => match &conn.client_cert {
+            None => Err((StatusCode::FORBIDDEN, "no client certificate")),
+            Some(cert)
+                if !cfg.client_certs.is_empty()
+                    && cfg
+                        .listed_client_cert(&cert.fingerprint, cert.cn.as_deref())
+                        .is_none() =>
+            {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "the client certificate is not listed",
+                ))
+            }
+            Some(_) => by_token(),
+        },
         // AIDEV-NOTE: a token that is presented must be valid. A request with a bad
         // token is refused even if its certificate alone would have been enough.
         AuthMode::MtlsOrToken if presented.is_some() => by_token(),
@@ -770,6 +780,11 @@ pub mod testing {
 
     /// Like `web`, with a server certificate for these names only.
     pub async fn web_named(auth: &str, extra: &str, names: &[&str]) -> Web {
+        web_built(auth, extra, names, true).await
+    }
+
+    /// Like `web_named`; with `listed` false, no client certificate is listed at all.
+    pub async fn web_built(auth: &str, extra: &str, names: &[&str], listed: bool) -> Web {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let ca = authority("opsmcp test ca");
@@ -787,6 +802,21 @@ pub mod testing {
             ExtendedKeyUsagePurpose::ClientAuth,
         );
 
+        // With mtls+token a certificate only lets a token in, so it is listed without
+        // roles; in the other modes it is a caller of its own.
+        let roles = |of: &str| match auth {
+            "mtls+token" => String::new(),
+            _ => format!("roles = [\"{of}\"]\n"),
+        };
+        let certs = match listed {
+            true => format!(
+                "[client_certs.alice]\ncn = \"alice\"\n{}[client_certs.bob-pinned]\nsha256 = \"{}\"\n{}",
+                roles("writer"),
+                sha256_hex(bob.der()),
+                roles("reader")
+            ),
+            false => String::new(),
+        };
         let config = format!(
             r#"{}
 [tokens.ci]
@@ -799,12 +829,7 @@ roles = ["writer"]
 sha256 = "{}"
 roles = ["writer"]
 expires = "2020-01-01"
-[client_certs.alice]
-cn = "alice"
-roles = ["writer"]
-[client_certs.bob-pinned]
-sha256 = "{}"
-roles = ["reader"]
+{}
 [http]
 listen = "127.0.0.1:0"
 tls_cert = "{dir}/server.pem"
@@ -820,7 +845,7 @@ auth = "{auth}"
             sha256_hex(CI_TOKEN.as_bytes()),
             sha256_hex(OPS_TOKEN.as_bytes()),
             sha256_hex(OLD_TOKEN.as_bytes()),
-            sha256_hex(bob.der()),
+            certs,
             dir = d.display(),
         );
         let (host, audit) = host(&config);
@@ -1312,17 +1337,16 @@ mod tests {
     async fn mtls_and_token_needs_both() {
         let web = web("mtls+token", "").await;
         let bearer = [("Authorization", "Bearer opsmcp_ci_token")];
-        // carol is not listed, and need not be: here the certificate only has to be
-        // genuine, and the token says who is calling
+        // alice's certificate lets the token in; the token says who is calling, and the
+        // roles her certificate has in other modes play no part
         let reply = web
-            .post(Some("carol"), &bearer, &call("echo", json!({"text": "hi"})))
+            .post(Some("alice"), &bearer, &call("echo", json!({"text": "hi"})))
             .await
             .unwrap();
         assert_eq!(reply.status, 200);
-        assert_eq!(
-            web.audited("tool_call").pop().unwrap()["principal"],
-            "token:ci"
-        );
+        let seen = web.audited("tool_call").pop().unwrap();
+        assert_eq!(seen["principal"], "token:ci");
+        assert_eq!(seen["roles"], json!(["reader"]));
         // a certificate without a token
         assert_eq!(
             web.post(Some("alice"), &[], PING).await.unwrap().status,
@@ -1330,6 +1354,51 @@ mod tests {
         );
         // a token without a certificate
         assert!(web.post(None, &bearer, PING).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mtls_and_token_takes_a_token_only_with_a_listed_certificate_when_any_are_listed() {
+        let web = web("mtls+token", "").await;
+        let bearer = [("Authorization", "Bearer opsmcp_ci_token")];
+        // listed by common name, and listed by fingerprint
+        for listed in ["alice", "bob"] {
+            let reply = web.post(Some(listed), &bearer, PING).await.unwrap();
+            assert_eq!(reply.status, 200, "{listed}");
+        }
+        assert!(web.audited("auth_failure").is_empty());
+        // carol's certificate is from the same CA, which is not enough: a host that was
+        // sent this token and holds a certificate of that CA cannot use the token here
+        let reply = web
+            .post(
+                Some("carol"),
+                &bearer,
+                &call("touch", json!({"name": "alpha"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status, 403);
+        assert!(!reply.body.contains("listed"), "{}", reply.body);
+        let refused = web.audited("auth_failure");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["reason"], "the client certificate is not listed");
+        assert!(web.effects.touched.lock().unwrap().is_empty());
+        // a certificate from another CA does not get as far as being looked up
+        assert!(web.post(Some("mallory"), &bearer, PING).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mtls_and_token_takes_any_certificate_of_the_ca_when_none_is_listed() {
+        let web = web_built("mtls+token", "", &["localhost", "127.0.0.1"], false).await;
+        let bearer = [("Authorization", "Bearer opsmcp_ci_token")];
+        for anyone in ["alice", "carol"] {
+            let reply = web.post(Some(anyone), &bearer, PING).await.unwrap();
+            assert_eq!(reply.status, 200, "{anyone}");
+        }
+        assert_eq!(
+            web.post(Some("carol"), &[], PING).await.unwrap().status,
+            401
+        );
+        assert!(web.post(Some("mallory"), &bearer, PING).await.is_err());
     }
 
     #[tokio::test]

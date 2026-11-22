@@ -164,9 +164,9 @@ port = 8443
 # bearer token goes to every host such a rule covers, and a host that is sent one could
 # use it on the others. With `auth = "mtls+token"` on the hosts, a token only works
 # through this server, and this server's certificate does nothing without a token:
-# neither alone is enough. A host takes a token with ANY certificate its client_ca
-# issued, so name this certificate itself as client_ca there (the README has the openssl
-# line for one that signs itself), or a CA that issues nothing else.
+# neither alone is enough. List this certificate on the hosts too
+# ([client_certs.bastion] cn = "..."): with none listed, a host takes a token with ANY
+# certificate its client_ca issued.
 # client_cert = "/etc/opsmcp/fleet/client.crt"
 # client_key = "/etc/opsmcp/fleet/client.key"   # chmod 600
 

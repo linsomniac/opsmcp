@@ -94,6 +94,46 @@ fn check_config_accepts_a_valid_configuration_and_summarises_it() {
 }
 
 #[test]
+fn check_config_says_which_certificates_let_a_token_in() {
+    let dir = tempfile::tempdir().unwrap();
+    self_signed(dir.path(), "server");
+    let http = format!(
+        "[tokens.dana]\nsha256 = \"{}\"\nroles = [\"readonly\"]\n\
+         [http]\nlisten = \"127.0.0.1:8443\"\ntls_cert = \"{d}/server.pem\"\n\
+         tls_key = \"{d}/server.key\"\nclient_ca = \"{d}/server.pem\"\nauth = \"mtls+token\"\n",
+        sha256_of("opsmcp_end_to_end_token"),
+        d = dir.path().display()
+    );
+    let summary = |certs: &str| -> String {
+        let setup = Setup::new(&format!("{}{certs}{http}", reader_config()));
+        let out = setup.run("check-config");
+        assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+
+    // one certificate is listed: nothing else the CA issued lets a token in
+    let listed = summary("[client_certs.bastion]\ncn = \"bastion1.example.com\"\n");
+    let https = listed.lines().find(|l| l.starts_with("HTTPS:")).unwrap();
+    assert!(
+        https.contains("mtls+token") && https.contains("only with a client certificate listed"),
+        "{https}"
+    );
+    let bastion = listed
+        .lines()
+        .find(|l| l.contains("client certificate") && l.contains("bastion"))
+        .expect(&listed);
+    assert!(bastion.contains("lets a token in"), "{bastion}");
+
+    // none is listed: the whole CA does, which is worth seeing
+    let any = summary("");
+    let https = any.lines().find(|l| l.starts_with("HTTPS:")).unwrap();
+    assert!(
+        https.contains("mtls+token") && https.contains("any client certificate"),
+        "{https}"
+    );
+}
+
+#[test]
 fn check_config_reports_every_problem_and_fails() {
     let setup =
         Setup::new("[roles.ops]\nallow = [\"@write\"]\n[unix_users.bob]\nroles = [\"missing\"]\n");

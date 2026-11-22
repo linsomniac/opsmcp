@@ -85,6 +85,10 @@ pub struct ClientCertCfg {
     pub cn: Option<String>,
     /// SHA-256 fingerprint of one exact certificate.
     pub sha256: Option<String>,
+    /// The roles of the caller this certificate is. Required, except with
+    /// `http.auth = "mtls+token"`, where it must be left out: see
+    /// `Config::certificates_only_let_tokens_in`.
+    #[serde(default)]
     pub roles: Vec<String>,
 }
 
@@ -97,7 +101,9 @@ pub enum AuthMode {
     /// A client certificate listed in `client_certs` is required.
     #[serde(rename = "mtls")]
     Mtls,
-    /// A client certificate from `client_ca` and a bearer token are both required.
+    /// A client certificate from `client_ca` and a bearer token are both required. If
+    /// any certificates are listed in `client_certs`, the certificate must be one of
+    /// them.
     #[serde(rename = "mtls+token")]
     MtlsAndToken,
     /// Either a listed client certificate or a bearer token.
@@ -830,7 +836,17 @@ impl Config {
         }
         for (name, cert) in &self.client_certs {
             let at = format!("client_certs.{name}");
-            self.check_roles(&at, &cert.roles, &mut errs);
+            if !self.certificates_only_let_tokens_in() {
+                self.check_roles(&at, &cert.roles, &mut errs);
+            } else if !cert.roles.is_empty() {
+                // A setting that reads as a grant and gives nothing is how a
+                // configuration gets misread, so it is refused, not ignored.
+                errs.push(format!(
+                    "{at}.roles: not used with http.auth = \"mtls+token\", where a listed \
+                     certificate only lets a token in and the token says who is calling \
+                     and what they may do: leave roles out"
+                ));
+            }
             match (&cert.cn, &cert.sha256) {
                 (None, None) => errs.push(format!("{at}: needs a cn or a sha256 fingerprint")),
                 (cn, sha256) => {
@@ -1529,8 +1545,32 @@ impl Config {
         Some(self.principal(format!("token:{name}"), roles))
     }
 
+    /// Whether client certificates never say who is calling here, which is so with
+    /// `http.auth = "mtls+token"`.
+    ///
+    /// AIDEV-NOTE: in that mode the token is the caller. A `[client_certs]` entry then
+    /// has no roles and does one thing: once any is listed, a token is only taken with
+    /// a listed certificate, not with whatever else `http.client_ca` issued. That is
+    /// what lets hosts share one CA with everything else and still take passed-on
+    /// tokens from the fleet server alone (list its certificate by cn or sha256). With
+    /// none listed, any certificate of the CA will do, which is only right for a CA
+    /// that issues nothing else; `check-config` says which of the two is in effect.
+    pub fn certificates_only_let_tokens_in(&self) -> bool {
+        self.http
+            .as_ref()
+            .is_some_and(|http| http.auth == AuthMode::MtlsAndToken)
+    }
+
     /// The caller for a verified client certificate, or `None` if it is not listed.
     pub fn principal_for_cert(&self, fingerprint: &str, cn: Option<&str>) -> Option<Principal> {
+        let name = self.listed_client_cert(fingerprint, cn)?;
+        let roles = self.client_certs.get(name)?.roles.iter().cloned().collect();
+        Some(self.principal(format!("cert:{name}"), roles))
+    }
+
+    /// The name of the `[client_certs]` entry a verified client certificate is listed
+    /// under, or `None` if it is not listed.
+    pub fn listed_client_cert(&self, fingerprint: &str, cn: Option<&str>) -> Option<&str> {
         let fingerprint = normalize_sha256(fingerprint)?;
         // Every attribute an entry names must match. An entry pinned to a fingerprint is
         // more specific than one that only names a CN, so it is preferred.
@@ -1545,13 +1585,11 @@ impl Config {
             };
             (cert.sha256.is_some() || cert.cn.is_some()) && fingerprint_ok && cn_ok
         };
-        let (name, cert) = self
-            .client_certs
+        self.client_certs
             .iter()
             .filter(|(_, cert)| matches(cert))
-            .max_by_key(|(_, cert)| cert.sha256.is_some())?;
-        let roles = cert.roles.iter().cloned().collect();
-        Some(self.principal(format!("cert:{name}"), roles))
+            .max_by_key(|(_, cert)| cert.sha256.is_some())
+            .map(|(name, _)| name.as_str())
     }
 }
 
@@ -2364,6 +2402,56 @@ client_key = \"/etc/opsmcp/fleet/client.key\"
         let text =
             format!("{ROLES}\n[client_certs.laptop]\nsha256 = \"zz\"\nroles = [\"admin\"]\n");
         assert_one_error_mentions(&text, &["laptop", "sha256"]);
+    }
+
+    #[test]
+    fn a_certificate_that_only_lets_a_token_in_is_listed_without_roles() {
+        let bastion = "[client_certs.bastion]\ncn = \"bastion1.example.com\"\n";
+        let http = |auth: &str| {
+            format!("{HTTP}auth = \"{auth}\"\nclient_ca = \"/etc/opsmcp/tls/ca.crt\"\n")
+        };
+        // with mtls+token the token says who is calling and what they may do
+        assert_eq!(
+            errors(&format!("{ROLES}\n{bastion}{}", http("mtls+token"))),
+            Vec::<String>::new()
+        );
+        // roles there would read as if the certificate gave them, and it never does
+        assert_one_error_mentions(
+            &format!(
+                "{ROLES}\n{bastion}roles = [\"admin\"]\n{}",
+                http("mtls+token")
+            ),
+            &["client_certs.bastion", "roles", "mtls+token"],
+        );
+        // in every other mode a listed certificate is a caller, and a caller needs roles
+        for rest in [http("mtls"), http("mtls-or-token"), String::new()] {
+            assert_one_error_mentions(
+                &format!("{ROLES}\n{bastion}{rest}"),
+                &["client_certs.bastion", "roles"],
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_certificate_is_told_from_one_that_is_merely_genuine() {
+        let cfg = members();
+        assert_eq!(
+            cfg.listed_client_cert(&"ab".repeat(32), Some("whoever")),
+            Some("laptop")
+        );
+        assert_eq!(
+            cfg.listed_client_cert(&"cd".repeat(32), Some("deploy.example.com")),
+            Some("deploy")
+        );
+        assert_eq!(
+            cfg.listed_client_cert(&"cd".repeat(32), Some("other.example.com")),
+            None
+        );
+        assert_eq!(cfg.listed_client_cert(&"cd".repeat(32), None), None);
+        assert_eq!(
+            cfg.listed_client_cert("not a fingerprint", Some("deploy.example.com")),
+            None
+        );
     }
 
     const HTTP: &str = r#"

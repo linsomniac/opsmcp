@@ -578,9 +578,22 @@ fn check_config(path: &Path) -> Result<(), String> {
     }
     match &cfg.http {
         Some(http) => {
+            // With mtls+token, which certificates let a token in depends on whether
+            // any is listed, and the difference is the whole CA: say which it is.
+            let certificates = match (
+                cfg.certificates_only_let_tokens_in(),
+                cfg.client_certs.is_empty(),
+            ) {
+                (false, _) => "",
+                (true, false) => ": a token, and only with a client certificate listed below",
+                (true, true) => {
+                    ": a token, with any client certificate that client_ca issued \
+                     (list some under [client_certs] to take only those)"
+                }
+            };
             let _ = writeln!(
                 out,
-                "HTTPS: {} (authentication: {})",
+                "HTTPS: {} (authentication: {}{certificates})",
                 http.listen,
                 http.auth.as_str()
             );
@@ -629,11 +642,11 @@ fn check_config(path: &Path) -> Result<(), String> {
         ]);
     }
     for (name, cert) in &cfg.client_certs {
-        rows.push(vec![
-            "client certificate".to_string(),
-            name.clone(),
-            cert.roles.join(", "),
-        ]);
+        let roles = match cfg.certificates_only_let_tokens_in() {
+            true => "(lets a token in)".to_string(),
+            false => cert.roles.join(", "),
+        };
+        rows.push(vec!["client certificate".to_string(), name.clone(), roles]);
     }
     if rows.is_empty() {
         let _ = writeln!(out, "  (none: nobody can use this server)");
