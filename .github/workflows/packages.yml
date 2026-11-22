@@ -1,0 +1,138 @@
+name: Packages
+
+# Builds and checks everything a release ships: statically linked binaries in tarballs,
+# and .deb packages for Ubuntu 26.04. CI calls this for every push, so that packaging
+# is never tried for the first time on the day of a release; Release calls it for a tag
+# and publishes what it uploads.
+#
+# AIDEV-NOTE: the packaging itself is scripts/package-release.sh, which runs the same
+# way on a developer's machine. Keep the steps here to installing a toolchain, building
+# and calling it.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: What to check out. Empty for the commit the caller is running for.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# bash with pipefail everywhere, the job in a container included: a download that fails
+# half way through a pipe must fail the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  static:
+    name: Static binary (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Install stable Rust and the musl C compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${{ matrix.target }}"
+          rustup override set stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        run: scripts/package-release.sh tarball "${{ matrix.target }}"
+
+      - name: Check the tarball
+        run: |
+          mkdir unpacked
+          tar -C unpacked -xzf dist/opsmcp-*-"${{ matrix.target }}".tar.gz
+          cd unpacked/opsmcp-*
+          ./opsmcp --version
+          # No loader and no shared libraries, so it runs on any distribution.
+          file opsmcp | grep -Eq 'statically linked|static-pie linked'
+          for part in README.md examples/config.example.toml systemd/opsmcp-http.service; do
+            test -f "$part"
+          done
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  deb:
+    name: Ubuntu 26.04 package (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    # Built on the release it is for: the binary links against that release's libraries
+    # and the package's dependencies are read from them.
+    container: ubuntu:26.04
+    timeout-minutes: 30
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      # git comes first so that the checkout below is a real clone.
+      - name: Install build tools and stable Rust
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl gcc libc6-dev dpkg-dev git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        run: scripts/package-release.sh deb "${{ matrix.target }}"
+
+      # This container is thrown away after the job, so the package can be installed
+      # in it: that it installs, runs, switches nothing on and removes cleanly.
+      - name: Install the package and try it
+        run: scripts/test-deb.sh dist/opsmcp_*_ubuntu26.04_${{ matrix.arch }}.deb
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-deb-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0

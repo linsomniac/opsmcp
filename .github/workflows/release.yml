@@ -1,0 +1,154 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (the version in Cargo.toml) publishes a GitHub release with the
+# static binaries in tarballs, the .deb packages for Ubuntu 26.04 and their checksums.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Match tag to Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          test -n "$package_version"
+          test "$RELEASE_TAG" = "v$package_version" || {
+            echo "tag $RELEASE_TAG does not match Cargo.toml version $package_version" >&2
+            exit 1
+          }
+          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}"
+          echo "version=$package_version" >>"$GITHUB_OUTPUT"
+
+  # A tag can be put on any commit, including one CI never ran for, so the tests run
+  # here too before anything is published.
+  test:
+    name: Lint and test the tagged source
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add --toolchain stable clippy
+          rustup override set stable
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  packages:
+    name: Packages
+    needs: validate
+    uses: ./.github/workflows/packages.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - test
+      - packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksums=$(mktemp)
+          trap 'rm -f -- "$checksums"' EXIT
+          (
+            cd dist
+            find . -maxdepth 1 -type f -printf '%f\n' \
+              | LC_ALL=C sort \
+              | xargs sha256sum
+          ) >"$checksums"
+          mv "$checksums" dist/SHA256SUMS
+          trap - EXIT
+          cat dist/SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A version like 1.2.0-rc1 is published as a pre-release.
+          prerelease=()
+          if [[ $VERSION == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag \
+            --generate-notes \
+            "${prerelease[@]}" \
+            --title "opsmcp $VERSION"

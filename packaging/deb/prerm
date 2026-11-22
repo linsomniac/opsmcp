@@ -1,0 +1,8 @@
+#!/bin/sh
+# On removal (not on an upgrade), servers the operator switched on are stopped and
+# switched off: their binary is about to go.
+set -e
+
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now opsmcp-http.service opsmcp-fleet-http.service || true
+fi

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Installing switches nothing on. This only tells systemd about the unit files and, on
+# an upgrade, has a server that is already running start again with the new binary.
+set -e
+
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    if [ -n "$2" ]; then
+        systemctl try-restart opsmcp-http.service opsmcp-fleet-http.service || true
+    fi
+fi

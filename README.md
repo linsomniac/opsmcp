@@ -52,6 +52,65 @@ sudo opsmcp check-config             # validates, and summarises who may do what
 `opsmcp tools` lists every tool with its permission. `opsmcp whoami` shows how you are
 identified and which tools you would be offered.
 
+### Packages
+
+Each release has these, with a `SHA256SUMS` file:
+
+| File | For |
+| --- | --- |
+| `opsmcp_VERSION_ubuntu26.04_amd64.deb`, `..._arm64.deb` | Ubuntu 26.04 |
+| `opsmcp-VERSION-x86_64-unknown-linux-musl.tar.gz`, `...-aarch64-...` | any distribution: a statically linked binary, the examples and the unit files |
+
+```sh
+sudo apt install ./opsmcp_0.1.0_ubuntu26.04_amd64.deb
+```
+
+The package installs `/usr/bin/opsmcp`, the two unit files, and the examples under
+`/usr/share/opsmcp/examples`. It switches nothing on: there is no configuration, no
+sudoers rule and no enabled service until you add them, and nobody can use opsmcp until
+`/etc/opsmcp/config.toml` gives them a role. Removing the package leaves `/etc/opsmcp`
+alone.
+
+The binary in the tarball looks users and groups up in `/etc/passwd` and `/etc/group`
+only (see [below](#building-for-other-hosts)); the one in the `.deb` uses the system's
+C library, so accounts from LDAP or sssd are found too.
+
+**NixOS.** The flake has the package (`packages.<system>.default`, and `opsmcp-static`
+for the statically linked one), an overlay, and a module:
+
+```nix
+{
+  inputs.opsmcp.url = "github:OWNER/REPO";
+
+  outputs = { nixpkgs, opsmcp, ... }: {
+    nixosConfigurations.web1 = nixpkgs.lib.nixosSystem {
+      modules = [
+        opsmcp.nixosModules.default
+        {
+          services.opsmcp = {
+            enable = true;
+            sudoGroups = [ "wheel" ];       # may run `sudo opsmcp serve`
+            settings = {                     # becomes /etc/opsmcp/config.toml
+              roles.readonly.allow = [ "@read" ];
+              unix_groups.wheel.roles = [ "readonly" ];
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+`services.opsmcp.http.enable` runs `opsmcp serve-http` as configured under
+`settings.http`, and `services.opsmcp.usrBinLink` links `/usr/bin/opsmcp`, the path a
+fleet server runs on its hosts, so that a NixOS host answers like any other.
+
+To make the packages yourself: `scripts/package-release.sh tarball TARGET` or
+`scripts/package-release.sh deb TARGET` after `cargo build --release --target TARGET`
+(a `.deb` is for the release of Debian or Ubuntu it is built on), and
+`scripts/test-deb.sh` installs one in a throwaway container and tries it.
+
 ### Building for other hosts
 
 A binary only runs where the C library it was linked against is present, so build for
@@ -63,7 +122,7 @@ anywhere else: its loader is a `/nix/store` path). Build a statically linked one
 instead, which runs on any x86_64 Linux whatever its distribution or glibc version:
 
 ```sh
-nix-build packaging/static.nix
+nix-build packaging/static.nix          # or, with flakes: nix build .#opsmcp-static
 scp result/bin/opsmcp root@host:/usr/bin/opsmcp
 ```
 
@@ -1191,7 +1250,13 @@ call's time limit has passed.
 cargo test                     # unit tests and end-to-end tests of the built binary
 cargo clippy --all-targets     # unwrap, expect and panic are denied outside tests
 cargo fmt
+nix flake check                # builds the package and boots a NixOS VM set up by the module
 ```
+
+CI (`.github/workflows/ci.yml`) runs these and builds every package for each push. A
+release is a tag: set `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z` and push
+the tag; `release.yml` checks that the two agree, tests the tagged source and publishes
+the packages.
 
 No `unsafe` code. The layout:
 
@@ -1207,6 +1272,7 @@ No `unsafe` code. The layout:
 | `src/tools/` | the tools, one file per area; `paths.rs` is the safe way to open a path, and `mod.rs` holds the test stand-ins (`FakeBins`) |
 | `src/fleet/` | the fleet server: `inventory.rs` (hosts and how callers name them), `access.rs` (which rule decides), `mod.rs` (the order of checks for a call), `ssh.rs`, `https.rs` and `link.rs` (reaching a host), `pool.rs` (sessions kept open, hosts left alone), `merge.rs` (several hosts' answers as one), `setup.rs` (reading the inventory and credentials, and keeping the inventory current) |
 | `tests/cli.rs` | end-to-end tests |
+| `scripts/`, `packaging/`, `nix/`, `flake.nix` | packaging: the script that makes the tarballs and the `.deb`, the unit files and examples they carry, and the Nix package, NixOS module and its test |
 
 Comments marked `AIDEV-NOTE:` explain the decisions that the security of the whole
 rests on; `grep -rn AIDEV- src/` lists them.
