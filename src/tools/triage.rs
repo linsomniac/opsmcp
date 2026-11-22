@@ -872,7 +872,7 @@ async fn run_summary(
 }
 
 /// journalctl --quiet prints nothing (and may exit 1) when nothing matched.
-fn no_entries(out: &CmdOutput) -> bool {
+pub(super) fn no_entries(out: &CmdOutput) -> bool {
     out.stdout.iter().all(u8::is_ascii_whitespace)
         && out.stderr.iter().all(u8::is_ascii_whitespace)
         && !out.timed_out
@@ -933,7 +933,7 @@ pub fn normalize_message(message: &str) -> String {
 /// A journal field as text. In JSON output a field is a string, an array of byte values
 /// (when it is not valid UTF-8), an array of values (when the entry has the field more
 /// than once: the first is taken), or null.
-fn field_text(value: Option<&Value>) -> Option<String> {
+pub(super) fn field_text(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::String(text) => Some(text.clone()),
         Value::Array(items) => {

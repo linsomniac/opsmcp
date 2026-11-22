@@ -1,0 +1,193 @@
+# opsmcp fleet server configuration. Install as /etc/opsmcp/fleet.toml (for a bastion),
+# or anywhere you like for your own use (`opsmcp fleet --config ~/.config/opsmcp/fleet.toml`).
+#
+# A fleet server is one MCP connection in front of many hosts that each run
+# `opsmcp serve` (or `serve-http`) with their own /etc/opsmcp/config.toml. It runs no
+# tools itself: it decides who may reach which hosts, with which credential, and passes
+# calls on. Each host still applies its own roles and keeps its own audit trail.
+#
+# Like a host's configuration, this file must be owned by root (or by you) and writable
+# by nobody else. After every change:
+#
+#     opsmcp check-config --config /etc/opsmcp/fleet.toml
+#
+# It is not interchangeable with a host's configuration: `opsmcp serve` refuses a file
+# with a [fleet] section, and `opsmcp fleet` refuses one without.
+
+# ---- Roles ---------------------------------------------------------------------------
+#
+# The same grants as on a host, with one difference: a grant here cannot be limited to a
+# resource ("service.control:nginx.service" is an error). The fleet server sees a tool's
+# name, never the unit or path a host resolves it to. Grant the permission here, and
+# limit it in the configuration of the hosts, for the account the fleet reaches them as.
+#
+# Tools that only a host defines (its [custom.NAME] tools) have the permission
+# custom.NAME here too, and are covered by @read / @all according to what the host says
+# they are.
+
+[roles.ops]
+allow = ["@all"]
+
+[roles.dev]
+allow = ["@read"]
+
+# ---- Callers -------------------------------------------------------------------------
+
+# `opsmcp fleet` (stdio: on your own machine, or `ssh bastion opsmcp fleet`).
+[unix_groups.ops]
+roles = ["ops"]
+
+# `opsmcp fleet-http`: bearer tokens and client certificates, exactly as on a host.
+# [tokens.dana]
+# sha256 = "..."            # from `opsmcp new-token dana`
+# roles = ["dev"]
+
+# ---- The fleet -----------------------------------------------------------------------
+
+[fleet]
+# What this server calls itself to the hosts; it appears in their audit trails.
+# Unset: this machine's host name.
+# name = "bastion1"
+
+# The hosts and their groups: a .toml or .json file (see hosts.example.toml) ...
+inventory = "/etc/opsmcp/fleet/hosts.toml"
+# ... or a command that prints the same as JSON.
+# inventory_command = ["/usr/local/bin/opsmcp-list-hosts"]
+
+# An Ansible inventory: what `ansible-inventory --list` prints, from the command or saved
+# to a .json file. A host is reached at its ansible_host and ansible_port, and every
+# Ansible group is a group here (with the hosts of its child groups). Hosts that cannot be
+# used here (a name with "_" in it, an address that is still a template) are left out,
+# and check-config says which. The command gets a UTF-8 locale and an otherwise empty
+# environment; if Ansible needs its own ansible.cfg or a home directory, name a small
+# script that sets them (the README has one).
+# inventory_format = "ansible"
+# inventory_command = ["/usr/bin/ansible-inventory", "-i", "/srv/ansible/hosts", "--list"]
+# inventory = "/etc/opsmcp/fleet/hosts.json"
+
+# The inventory is looked at again while the server runs, this many seconds apart: a file
+# is read again when it has changed, a command is run again. 0: never. Unset: 30 for a
+# file, 300 for a command. `opsmcp fleet-http` also reads it again on SIGHUP. A list that
+# cannot be read or is not valid never replaces the one in use.
+# inventory_refresh_secs = 30
+
+max_hosts_per_call = 50 # the most hosts one call may name
+max_parallel = 16       # hosts asked at the same time within one call
+max_connections = 64    # SSH sessions kept open (at least max_parallel)
+idle_secs = 300         # an SSH session unused for this long is closed
+connect_timeout_secs = 10
+retry_secs = 60         # a host that could not be reached is left alone this long
+
+# ---- Rules: who reaches which hosts, and as whom --------------------------------------
+#
+# For a caller and a host, the FIRST rule that names one of the caller's roles and
+# covers the host decides: which credential is used, and which roles' grants apply (only
+# the roles that rule names). If the host refuses that credential, the answer is no: no
+# other rule is tried.
+#
+#   hosts     host names, patterns over them (web*), and group:NAME
+#   via       "ssh"    runs `ssh HOST sudo -n /usr/bin/opsmcp serve`
+#             "https"  calls https://HOST:8443/mcp
+#   identity  "caller" the caller's own credential: their SSH keys and agent, or the
+#                      bearer token they presented. The host sees the person and applies
+#                      its own roles for them. This server holds nothing.
+#             "fleet"  a credential named here (ssh_key, token_file). The host sees a
+#                      service account, and who may use it is decided by this file.
+#                      This is how someone gets more through the fleet than their own
+#                      login allows, so keep those accounts modest on the hosts.
+#   read_only only tools that change nothing; the hosts are told to enforce it too.
+#
+# A rule with identity = "caller" only fits callers who have that kind of credential:
+# via = "ssh" needs the server to run as the caller (`opsmcp fleet`, not through sudo
+# and not `fleet-http`); via = "https" needs the caller to have presented a token.
+
+# Operations staff reach everything as themselves.
+[[fleet.access]]
+name = "ops-own"
+roles = ["ops"]
+hosts = ["*"]
+via = "ssh"
+identity = "caller"
+# ssh_user = "ops"        # if the account on the hosts differs from their ssh settings
+
+# Developers may look at the web tier, through an account that exists for that.
+[[fleet.access]]
+name = "dev-web"
+roles = ["dev"]
+hosts = ["group:web"]
+via = "ssh"
+identity = "fleet"
+ssh_user = "opsmcp-dev"
+ssh_key = "/etc/opsmcp/fleet/dev_ed25519" # chmod 600
+read_only = true
+
+# The same over HTTPS, with a token of the fleet's own. Any rule over HTTPS needs
+# client_cert and client_key under [fleet.https] below.
+# [[fleet.access]]
+# name = "dev-db"
+# roles = ["dev"]
+# hosts = ["group:db"]
+# via = "https"
+# identity = "fleet"
+# token_file = "/etc/opsmcp/fleet/dev.token"   # one line, chmod 600
+# read_only = true
+
+# Callers of `fleet-http` reaching hosts with their own token: each host must know the
+# token too (the same [tokens.NAME] hash in its configuration). Every host the rule
+# covers is sent the token, and a token is good wherever it alone is enough: use
+# `auth = "mtls+token"` on the hosts (they then want client_cert below as well) and
+# under [http] here, so that a host which is sent a token cannot use it anywhere.
+# [[fleet.access]]
+# name = "ops-token"
+# roles = ["ops"]
+# hosts = ["*"]
+# via = "https"
+# identity = "caller"
+
+# ---- How hosts are reached -------------------------------------------------------------
+
+[fleet.ssh]
+# What is run on a host. Plain words only: it passes through the host's shell.
+remote_command = ["sudo", "-n", "/usr/bin/opsmcp", "serve"]
+# Extra `ssh -o` options, for the connection: jump hosts, known-hosts files and the like.
+# Options that say who to log in as, or that opsmcp sets itself, cannot be given here.
+# options = ["ProxyJump=jump.example.com", "UserKnownHostsFile=/etc/opsmcp/fleet/known_hosts"]
+# Host keys are always checked. The default refuses a host that is not in known_hosts;
+# "StrictHostKeyChecking=accept-new" may be given to trust a host on first contact.
+# port = 22
+
+[fleet.https]
+port = 8443
+# The CA that issued the hosts' certificates. Unset: this machine's CA bundle.
+# ca = "/etc/opsmcp/fleet/hosts-ca.crt"
+# This server's client certificate. REQUIRED as soon as a rule has via = "https": a
+# bearer token goes to every host such a rule covers, and a host that is sent one could
+# use it on the others. With `auth = "mtls+token"` on the hosts, a token only works
+# through this server, and this server's certificate does nothing without a token:
+# neither alone is enough. A host takes a token with ANY certificate its client_ca
+# issued, so name this certificate itself as client_ca there (the README has the openssl
+# line for one that signs itself), or a CA that issues nothing else.
+# client_cert = "/etc/opsmcp/fleet/client.crt"
+# client_key = "/etc/opsmcp/fleet/client.key"   # chmod 600
+
+# ---- For `opsmcp fleet-http` ----------------------------------------------------------
+
+# [http]
+# listen = "0.0.0.0:8443"
+# tls_cert = "/etc/opsmcp/tls/server.crt"
+# tls_key = "/etc/opsmcp/tls/server.key"
+# auth = "token"
+
+# ---- Audit and limits: as on a host ---------------------------------------------------
+
+[audit]
+syslog = true
+# file = "/var/log/opsmcp/fleet-audit.jsonl"
+fail_closed = true # nothing is passed on to a host if its audit record cannot be written
+
+[limits]
+# Keep these at least as large as on the hosts, or a host's own answer or time limit
+# is cut short here.
+max_output_bytes = 65536
+call_timeout_secs = 120
+max_concurrent_calls = 8

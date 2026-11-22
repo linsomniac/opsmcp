@@ -1,8 +1,8 @@
 //! Configuration checks: a service's own syntax check, before a reload.
 
 use super::args::{Args, Param};
-use super::{Ctx, Tool, ToolError, ToolResult, command_ok, command_text, required};
-use crate::exec::CmdOutput;
+use super::{Ctx, Tool, ToolError, ToolResult, command_text, required};
+use crate::exec::{Cmd, CmdOutput};
 use crate::policy::Access;
 use crate::sanitize::{keep_tail, redact_text};
 
@@ -110,14 +110,21 @@ pub fn tools() -> Vec<Tool> {
     )]
 }
 
-/// The verdict line for a finished check.
-fn verdict(out: &CmdOutput) -> String {
+/// The verdict line for a finished check. `said` is what the checker printed.
+fn verdict(out: &CmdOutput, said: &str) -> String {
     if out.timed_out {
         "Result: unknown (the check did not finish within its time limit)".to_string()
     } else if let Some(signal) = out.signal {
         format!("Result: unknown (the check was killed by signal {signal})")
     } else {
         match out.code {
+            // AIDEV-NOTE: an exit status of 0 is not always a clean bill of health.
+            // `postfix check` reports a mistyped parameter as a warning and exits 0, and
+            // haproxy and nginx warn about things that will bite later. The verdict stays
+            // "valid" (the checker did not refuse the configuration), but says to read on.
+            Some(0) if has_warning(said) => "Result: valid, with warnings (read them: some \
+                                             checkers report mistakes only as warnings)"
+                .to_string(),
             Some(0) => "Result: valid".to_string(),
             Some(code) => format!("Result: INVALID (exit {code})"),
             None => "Result: unknown (the check did not report an exit status)".to_string(),
@@ -125,45 +132,83 @@ fn verdict(out: &CmdOutput) -> String {
     }
 }
 
-async fn config_validate(ctx: Ctx, args: Args) -> ToolResult {
-    let asked = required(&args, "service")?;
-    let Some(check) = CHECKS.iter().find(|check| check.name == asked) else {
-        return Err(ToolError::Invalid(format!(
-            "{asked:?} is not a known check"
-        )));
-    };
-    // The resource is the check's name, so a grant can cover some checks and not others.
-    let auth = ctx.authorize(Some(check.name))?;
+/// What a finished check says about the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// The checker accepted it.
+    Valid,
+    /// The checker refused it.
+    Invalid,
+    /// The checker gave no verdict: it did not finish, or was killed.
+    Unknown,
+}
 
-    // The first of the check's commands that is installed.
-    let mut found = None;
+fn outcome(out: &CmdOutput) -> Outcome {
+    if out.timed_out || out.signal.is_some() {
+        return Outcome::Unknown;
+    }
+    match out.code {
+        Some(0) => Outcome::Valid,
+        Some(_) => Outcome::Invalid,
+        None => Outcome::Unknown,
+    }
+}
+
+/// Whether a checker's output has a line that calls itself a warning: `warning:` (postfix,
+/// sshd, most others), `[WARNING]` (haproxy) or `[warn]` (nginx), in any case.
+fn has_warning(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        let warns =
+            line.contains("warning:") || line.contains("[warning]") || line.contains("[warn]");
+        // `logrotate -d` says on every run that debug mode changes nothing: that is about
+        // how it was run, not about the configuration.
+        warns && !line.contains("logrotate in debug mode")
+    })
+}
+
+/// The check with this name, if there is one.
+pub(super) fn find_check(name: &str) -> Option<&'static Check> {
+    CHECKS.iter().find(|check| check.name == name)
+}
+
+/// The command that performs `check` on this host: the first of its commands that is
+/// installed. A caller about to depend on the check (config_edit) asks for this before
+/// changing anything, so that a missing program is found out first.
+pub(super) fn check_command(ctx: &Ctx, check: &Check) -> Result<Cmd, ToolError> {
     let mut missing = Vec::new();
     for (program, argv) in check.commands {
         match ctx.command(program) {
-            Ok(cmd) => {
-                found = Some(cmd.args(argv.iter().copied()));
-                break;
-            }
+            Ok(cmd) => return Ok(cmd.args(argv.iter().copied())),
             Err(ToolError::Failed(problem)) => missing.push(problem),
             Err(other) => return Err(other),
         }
     }
-    let Some(cmd) = found else {
-        return Err(ToolError::Failed(format!(
-            "cannot check {}: {}",
-            check.name,
-            missing.join("; ")
-        )));
-    };
+    Err(ToolError::Failed(format!(
+        "cannot check {}: {}",
+        check.name,
+        missing.join("; ")
+    )))
+}
 
+/// Runs a check's command. Returns what to show (the verdict first) and what the check
+/// says about the configuration. `reserve` is how much of the output limit the caller
+/// needs for text of its own.
+pub(super) async fn run_check(
+    ctx: &Ctx,
+    cmd: Cmd,
+    reserve: usize,
+) -> Result<(String, Outcome), ToolError> {
     let out = ctx.run(cmd).await?;
     // AIDEV-NOTE: the verdict is the FIRST line, so it survives whatever happens to a
     // long output; of the checker's own text the end is kept, which is where checkers
     // put the error that made them give up. Checkers echo the offending configuration
     // line, which can hold a password: mask what looks like a secret.
-    let head = verdict(&out);
     let said = redact_text(&command_text(&out));
-    let room = ctx.output_budget().saturating_sub(head.len() + 120);
+    let head = verdict(&out, &said);
+    let room = ctx
+        .output_budget()
+        .saturating_sub(head.len() + 120 + reserve);
     let (body, dropped) = keep_tail(&said, room);
     let mut text = format!("{head}\n");
     if dropped > 0 {
@@ -172,7 +217,21 @@ async fn config_validate(ctx: Ctx, args: Args) -> ToolResult {
         ));
     }
     text.push_str(&body);
-    auth.done(text, command_ok(&out))
+    Ok((text, outcome(&out)))
+}
+
+async fn config_validate(ctx: Ctx, args: Args) -> ToolResult {
+    let asked = required(&args, "service")?;
+    let Some(check) = find_check(asked) else {
+        return Err(ToolError::Invalid(format!(
+            "{asked:?} is not a known check"
+        )));
+    };
+    // The resource is the check's name, so a grant can cover some checks and not others.
+    let auth = ctx.authorize(Some(check.name))?;
+    let cmd = check_command(&ctx, check)?;
+    let (text, outcome) = run_check(&ctx, cmd, 0).await?;
+    auth.done(text, outcome == Outcome::Valid)
 }
 
 #[cfg(test)]
@@ -373,6 +432,84 @@ roles = ["web"]
             fake.calls("logrotate"),
             [strings(&["-d", "/etc/logrotate.conf"])]
         );
+    }
+
+    /// AIDEV-NOTE: `postfix check` reports a mistyped parameter as a warning and exits
+    /// 0. "Result: valid" over that would read as a clean bill of health.
+    #[tokio::test]
+    async fn warnings_from_a_checker_that_exits_cleanly_are_pointed_out() {
+        let fake = FakeBins::new()
+            .add_script(
+                "postfix",
+                "echo 'postfix: warning: /etc/postfix/main.cf: unused parameter: smtpd_tls_cert_fle=/x' >&2\nexit 0",
+            )
+            .add_script("nginx", "echo 'nginx: the configuration file syntax is ok' >&2");
+        let (host, _audit) = fixture(&fake);
+        let output = run(&host, "rita", json!({"service": "postfix"}))
+            .await
+            .unwrap();
+        // still a success: the checker did not refuse the configuration
+        assert!(!output.is_error());
+        assert!(
+            output.text().starts_with(
+                "Result: valid, with warnings (read them: some checkers report mistakes only as warnings)\n"
+            ),
+            "{}",
+            output.text()
+        );
+        assert!(
+            output.text().contains("unused parameter"),
+            "{}",
+            output.text()
+        );
+        // a checker that says nothing of the kind keeps the plain verdict
+        let text = ok_text(run(&host, "rita", json!({"service": "nginx"})).await);
+        assert!(text.starts_with("Result: valid\n"), "{text}");
+    }
+
+    #[test]
+    fn a_warning_is_a_line_that_says_it_is_one() {
+        for line in [
+            "postfix: warning: /etc/postfix/main.cf: unused parameter: x=y",
+            "Warning: the ECDSA host key is not readable",
+            "[WARNING]  (12) : config : missing timeouts for backend 'web'.",
+            "nginx: [warn] conflicting server name \"a\" on 0.0.0.0:80, ignored",
+            "first line\nsecond: WARNING: something",
+        ] {
+            assert!(has_warning(line), "{line}");
+        }
+        for line in [
+            "",
+            "syntax is ok",
+            "no warnings were found",
+            "error: found error in /etc/logrotate.d/app, skipping",
+            // logrotate -d says this on every run: it is about the mode, not the configuration
+            "warning: logrotate in debug mode does nothing except printing debug messages!  \
+             Consider using verbose mode (-v) instead if this is not what you want.",
+        ] {
+            assert!(!has_warning(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_outcome_of_a_check_is_valid_invalid_or_unknown() {
+        let out = |code: Option<i32>, timed_out: bool| CmdOutput {
+            code,
+            signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+            timed_out,
+        };
+        assert_eq!(outcome(&out(Some(0), false)), Outcome::Valid);
+        assert_eq!(outcome(&out(Some(1), false)), Outcome::Invalid);
+        assert_eq!(outcome(&out(None, true)), Outcome::Unknown);
+        assert_eq!(outcome(&out(None, false)), Outcome::Unknown);
+        let killed = CmdOutput {
+            signal: Some(9),
+            ..out(None, false)
+        };
+        assert_eq!(outcome(&killed), Outcome::Unknown);
     }
 
     #[tokio::test]

@@ -6,24 +6,45 @@ pub mod cluster;
 pub mod container;
 mod ctx;
 pub mod custom;
+pub mod cve;
+pub mod db;
+pub mod denials;
+pub mod dns;
+pub mod edit;
 pub mod firewall;
 pub mod fs;
+pub mod fwset;
+pub mod haproxy;
+pub mod hardware;
+pub mod headroom;
+pub mod history;
 pub mod kernel;
+pub mod kernelinfo;
 pub mod logs;
+pub mod lvm;
+pub mod monitoring;
+pub mod mounts;
 pub mod net;
 pub mod nrpe;
 pub mod package;
 pub mod paths;
+pub mod posture;
 pub mod process;
 pub mod reboot;
+pub mod reclaim;
 pub mod schedule;
+pub mod search;
 pub mod service;
+pub mod sessions;
 pub mod storage;
 pub mod system;
 pub mod timesync;
 pub mod tls;
+pub mod trace;
 pub mod triage;
+pub mod unitres;
 pub mod users;
+pub mod wait;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -307,6 +328,27 @@ fn built_in_tools() -> Vec<Tool> {
     tools.extend(timesync::tools());
     tools.extend(schedule::tools());
     tools.extend(checks::tools());
+    tools.extend(history::tools());
+    tools.extend(wait::tools());
+    tools.extend(search::tools());
+    tools.extend(edit::tools());
+    tools.extend(monitoring::tools());
+    tools.extend(haproxy::tools());
+    tools.extend(reclaim::tools());
+    tools.extend(lvm::tools());
+    tools.extend(mounts::tools());
+    tools.extend(unitres::tools());
+    tools.extend(sessions::tools());
+    tools.extend(trace::tools());
+    tools.extend(headroom::tools());
+    tools.extend(denials::tools());
+    tools.extend(fwset::tools());
+    tools.extend(dns::tools());
+    tools.extend(posture::tools());
+    tools.extend(cve::tools());
+    tools.extend(db::tools());
+    tools.extend(kernelinfo::tools());
+    tools.extend(hardware::tools());
     tools
 }
 
@@ -450,6 +492,8 @@ pub mod testing {
             access: tool.access,
             args: arguments,
             args_sha256: None,
+            read_only: false,
+            via: None,
         };
         tool.run(Ctx::new(host.clone(), Arc::new(call)), args).await
     }
@@ -519,11 +563,32 @@ pub mod testing {
 
         /// Adds a command whose behaviour is the shell fragment `body` (it sees the
         /// arguments as "$@"). Its arguments are recorded before `body` runs.
+        ///
+        /// AIDEV-NOTE: the record of one run is ONE line, appended with one write: the
+        /// arguments with a file-separator character after each, and line breaks inside
+        /// an argument written as a group-separator character. Tools run the same command
+        /// several times at once (mount_health probes mounts in parallel). A record of
+        /// several lines is not safe: bash writes it a line at a time, so the records of
+        /// two runs interleaved and tests failed at random under load. Only shell
+        /// builtins are used: a stand-in has no other commands on its PATH.
         pub fn add_script(mut self, name: &str, body: &str) -> FakeBins {
             let dir = self.dir.path().display().to_string();
             let script = format!(
                 "#!/bin/sh\n\
-                 {{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; printf -- '--END--\\n'; }} >> '{dir}/{name}.calls'\n\
+                 opsmcp_sep=$(printf '\\034')\n\
+                 opsmcp_nl=$(printf '\\035')\n\
+                 opsmcp_lf='\n\
+                 '\n\
+                 opsmcp_record=''\n\
+                 for opsmcp_arg in \"$@\"; do\n\
+                 while :; do\n\
+                 case $opsmcp_arg in\n\
+                 *\"$opsmcp_lf\"*) opsmcp_record=\"$opsmcp_record${{opsmcp_arg%%\"$opsmcp_lf\"*}}$opsmcp_nl\"; opsmcp_arg=${{opsmcp_arg#*\"$opsmcp_lf\"}} ;;\n\
+                 *) opsmcp_record=\"$opsmcp_record$opsmcp_arg$opsmcp_sep\"; break ;;\n\
+                 esac\n\
+                 done\n\
+                 done\n\
+                 printf '%s\\n' \"$opsmcp_record\" >> '{dir}/{name}.calls'\n\
                  {body}\n"
             );
             write_executable(std::path::Path::new(&format!("{dir}/{name}")), &script);
@@ -555,16 +620,18 @@ pub mod testing {
             let Ok(text) = std::fs::read_to_string(path) else {
                 return Vec::new();
             };
-            let mut calls = Vec::new();
-            let mut current = Vec::new();
-            for line in text.lines() {
-                if line == "--END--" {
-                    calls.push(std::mem::take(&mut current));
-                } else {
-                    current.push(line.to_string());
-                }
-            }
-            calls
+            // One run per line; see `add_script` for the format.
+            text.lines()
+                .map(|line| {
+                    let mut arguments: Vec<String> = line
+                        .split('\u{1c}')
+                        .map(|argument| argument.replace('\u{1d}', "\n"))
+                        .collect();
+                    // every argument is FOLLOWED by a separator: the last piece is empty
+                    arguments.pop();
+                    arguments
+                })
+                .collect()
         }
     }
 
@@ -581,6 +648,8 @@ pub mod testing {
             access,
             args: json!({"name": "value"}),
             args_sha256: None,
+            read_only: false,
+            via: None,
         };
         Ctx::new(host.clone(), Arc::new(call))
     }
@@ -674,6 +743,96 @@ roles = ["operator"]
         let ctx = testing::ctx(&host, "rita", "fs.view", Access::Read);
         assert!(ctx.permits("/srv/www/"));
         assert!(!ctx.permits("/srv/secret/keys/"));
+    }
+
+    /// The stand-in commands that tests use must record their runs faithfully, or every
+    /// test built on them is in doubt.
+    #[tokio::test]
+    async fn a_stand_in_records_each_run_whole_even_when_many_run_at_once() {
+        let fake = testing::FakeBins::new().add_script("probe", "exit 0");
+        let config = format!(
+            "[roles.r]\nallow = [\"@read\"]\n[unix_users.rita]\nroles = [\"r\"]\n{}",
+            fake.config_only()
+        );
+        let (host, _sink) = testing::host(&config);
+        let ctx = testing::ctx(&host, "rita", "system.view", Access::Read);
+
+        // awkward arguments: none, an empty one, spaces, and line breaks
+        for args in [
+            vec![],
+            vec!["", "a b", "--flag=x"],
+            vec!["first line\nsecond line\n", "-e", "last"],
+        ] {
+            let cmd = ctx.command("probe").unwrap().args(args);
+            assert_eq!(ctx.run(cmd).await.unwrap().code, Some(0));
+        }
+        assert_eq!(
+            fake.calls("probe"),
+            [
+                vec![],
+                vec!["".to_string(), "a b".to_string(), "--flag=x".to_string()],
+                vec![
+                    "first line\nsecond line\n".to_string(),
+                    "-e".to_string(),
+                    "last".to_string()
+                ],
+            ]
+        );
+
+        // many at once: every record must come out whole
+        let mut runs = Vec::new();
+        for n in 0..60 {
+            let ctx = ctx.clone();
+            runs.push(tokio::spawn(async move {
+                let cmd = ctx.command("probe").unwrap().args([
+                    "-f".to_string(),
+                    "--".to_string(),
+                    format!("/mnt/number-{n}"),
+                ]);
+                ctx.run(cmd).await.unwrap().code
+            }));
+        }
+        for run in runs {
+            assert_eq!(run.await.unwrap(), Some(0));
+        }
+        let mut seen: Vec<Vec<String>> = fake.calls("probe").split_off(3);
+        seen.sort();
+        let mut want: Vec<Vec<String>> = (0..60)
+            .map(|n| {
+                vec![
+                    "-f".to_string(),
+                    "--".to_string(),
+                    format!("/mnt/number-{n}"),
+                ]
+            })
+            .collect();
+        want.sort();
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn holds_read_on_answers_for_one_resource_of_another_read_permission() {
+        let config = "[roles.r]\nallow = [\"wait.use\", \"service.view:nginx.service\", \"journal.view\"]\n\
+                      deny = [\"journal.view:secret.service\"]\n\
+                      [unix_users.rita]\nroles = [\"r\"]\n";
+        let (host, sink) = testing::host(config);
+        let ctx = testing::ctx(&host, "rita", "wait.use", Access::Read);
+        assert!(ctx.holds_read_on("service.view", "nginx.service"));
+        // a scoped grant covers what it names and nothing else
+        assert!(!ctx.holds_read_on("service.view", "postgresql.service"));
+        // an unscoped grant covers every resource, except where a deny says otherwise
+        assert!(ctx.holds_read_on("journal.view", "nginx.service"));
+        assert!(!ctx.holds_read_on("journal.view", "secret.service"));
+        // not granted at all
+        assert!(!ctx.holds_read_on("fs.view", "/etc/"));
+        assert_eq!(sink.records().len(), 0);
+    }
+
+    #[test]
+    fn a_local_call_has_no_network_peer() {
+        let (host, _sink) = testing::host(CONFIG);
+        let ctx = testing::ctx(&host, "olivia", "service.view", Access::Read);
+        assert_eq!(ctx.peer(), None);
     }
 
     #[test]
@@ -934,10 +1093,13 @@ roles = ["operator"]
             names(&registry),
             [
                 "block_devices",
+                "cgroup_limits",
+                "change_history",
                 "cluster_maintenance_mode",
                 "cluster_node",
                 "cluster_resource",
                 "cluster_status",
+                "config_edit",
                 "config_validate",
                 "container_control",
                 "container_inspect",
@@ -945,25 +1107,40 @@ roles = ["operator"]
                 "container_logs",
                 "container_stats",
                 "corosync_status",
+                "cpu_profile",
                 "crash_events",
+                "cve_status",
+                "db_status",
                 "disk_health",
                 "disk_hogs",
                 "disk_io",
                 "disk_usage",
+                "dns_config",
                 "firewall_reset_counters",
+                "firewall_set_member",
+                "fs_grep",
                 "fs_list",
                 "fs_read",
+                "fs_search",
                 "fs_stat",
+                "haproxy_server_state",
+                "haproxy_servers",
+                "hardware_health",
                 "host_reboot",
                 "incident_snapshot",
                 "iptables_list",
                 "iptables_rule",
                 "journal_query",
                 "kernel_log",
+                "kernel_status",
+                "limits_headroom",
                 "log_list",
                 "log_read",
                 "log_summary",
+                "lvm_extend",
                 "memory_info",
+                "monitoring_downtime",
+                "mount_health",
                 "net_interfaces",
                 "net_probe",
                 "net_routes",
@@ -976,15 +1153,23 @@ roles = ["operator"]
                 "package_updates",
                 "package_upgrade",
                 "packet_capture",
+                "perf_history",
                 "process_info",
                 "process_list",
                 "process_signal",
+                "process_trace",
                 "resource_top",
                 "scheduled_jobs",
+                "security_denials",
+                "security_posture",
                 "service_control",
+                "service_dependencies",
                 "service_enable",
+                "service_limits",
                 "service_list",
                 "service_status",
+                "session_terminate",
+                "space_reclaim",
                 "sysctl_get",
                 "sysctl_set",
                 "sysfs_set",
@@ -993,6 +1178,7 @@ roles = ["operator"]
                 "tls_cert_check",
                 "user_list",
                 "user_modify",
+                "wait_for",
             ]
         );
     }
@@ -1009,9 +1195,13 @@ roles = ["operator"]
             "container.logs",
             "container.view",
             "crash.view",
+            "db.view",
             "firewall.view",
             "fs.read",
             "fs.view",
+            "haproxy.view",
+            "hardware.view",
+            "history.view",
             "journal.view",
             "kernel_log.view",
             "logs.view",
@@ -1020,8 +1210,10 @@ roles = ["operator"]
             "nrpe.run",
             "nrpe.view",
             "package.view",
+            "process.profile",
             "process.view",
             "schedule.view",
+            "security.view",
             "service.view",
             "storage.view",
             "sysctl.view",
@@ -1029,20 +1221,30 @@ roles = ["operator"]
             "time.view",
             "tls.view",
             "user.view",
+            "wait.use",
         ];
         let write = [
             "cluster.modify",
             "container.control",
             "firewall.modify",
+            "firewall.set",
+            "fs.write",
+            "haproxy.server",
             "host.reboot",
+            "monitoring.downtime",
             "net.capture",
             "package.modify",
             "process.signal",
+            "process.trace",
             "service.control",
             "service.enable",
+            "service.limits",
+            "storage.extend",
+            "storage.reclaim",
             "sysctl.modify",
             "sysfs.modify",
             "user.modify",
+            "user.session",
         ];
         let mut want: Vec<(String, Access)> = read
             .iter()

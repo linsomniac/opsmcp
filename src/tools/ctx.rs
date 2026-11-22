@@ -132,6 +132,12 @@ pub struct Call {
     pub args: Value,
     /// When `args` had to be shortened: the SHA-256 of the complete arguments.
     pub args_sha256: Option<String>,
+    /// The call may only use a tool that changes nothing: the session is read-only, or
+    /// the request asked to be held to that.
+    pub read_only: bool,
+    /// What a fleet server that passed the call on says about it (its own name, who it
+    /// is acting for, its call id). Recorded as a claim; it never decides anything.
+    pub via: Option<Value>,
 }
 
 /// Handed to a tool when it runs.
@@ -156,6 +162,11 @@ impl Ctx {
 
     pub fn principal(&self) -> &Principal {
         &self.call.principal
+    }
+
+    /// Whether this call may only use a tool that changes nothing.
+    pub fn read_only(&self) -> bool {
+        self.call.read_only
     }
 
     /// Asks the policy whether this call may act on `resource` (`None` when the operation
@@ -208,6 +219,28 @@ impl Ctx {
             .principal
             .rules
             .check(permission, Access::Read, None)
+    }
+
+    /// Whether the caller holds `permission`, which must be the permission of a READ
+    /// tool, for this one `resource`. Nothing is audited.
+    ///
+    /// AIDEV-NOTE: for a tool that answers a question another read tool also answers
+    /// (wait_for watching a unit, a port, a file or the journal). The tool authorizes the
+    /// call under its own permission as always, and uses this to refuse anything the
+    /// caller could not have asked the owning tool directly, so it cannot be used to get
+    /// around a missing grant or a deny. `resource` must be named exactly as the owning
+    /// tool names it. Only pass the name of a read permission (see `holds_read`).
+    pub fn holds_read_on(&self, permission: &str, resource: &str) -> bool {
+        self.call
+            .principal
+            .rules
+            .check(permission, Access::Read, Some(resource))
+    }
+
+    /// The network address the call came from (`ADDRESS:PORT`), for calls over HTTPS.
+    /// `None` for local and SSH use.
+    pub fn peer(&self) -> Option<&str> {
+        self.call.peer.as_deref()
     }
 
     /// How much text a tool should produce at most, leaving room in the server's output
@@ -299,6 +332,15 @@ impl Ctx {
             fields.insert("args".to_string(), call.args.clone());
             if let Some(digest) = &call.args_sha256 {
                 fields.insert("args_sha256".to_string(), json!(digest));
+            }
+            if call.read_only {
+                fields.insert("read_only".to_string(), json!(true));
+            }
+            // AIDEV-NOTE: `via` is what the caller SAYS about where the call came from.
+            // `principal` above is who was authenticated, and the only thing any decision
+            // is based on. Keep the two apart: never copy a claim into `principal`.
+            if let Some(via) = &call.via {
+                fields.insert("via".to_string(), via.clone());
             }
         }
         let severity = if allowed {

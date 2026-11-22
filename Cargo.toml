@@ -12,7 +12,7 @@ clap = { version = "4.6.8", features = ["derive"] }
 flate2 = "1.1.11"
 getrandom = "0.4.3"
 http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper = { version = "1.12.0", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 log = "0.4.35"
 nix = { version = "0.32.0", features = ["user", "fs", "signal"] }

@@ -152,22 +152,22 @@ pub fn split_cmdline(raw: &[u8]) -> Vec<String> {
 }
 
 /// One process, as read from /proc.
-struct Proc {
-    stat: Stat,
-    uid: u32,
+pub(super) struct Proc {
+    pub(super) stat: Stat,
+    pub(super) uid: u32,
     args: Vec<String>,
 }
 
 impl Proc {
     /// `None` if the process is gone (or hidden from us).
-    fn read(pid: i32) -> Option<Proc> {
+    pub(super) fn read(pid: i32) -> Option<Proc> {
         let stat = parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
         let uid = parse_uid(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)?;
         let args = split_cmdline(&read_capped(&format!("/proc/{pid}/cmdline"), 16 * 1024));
         Some(Proc { stat, uid, args })
     }
 
-    fn is_kernel_thread(&self) -> bool {
+    pub(super) fn is_kernel_thread(&self) -> bool {
         self.stat.flags & PF_KTHREAD != 0
     }
 
@@ -244,7 +244,7 @@ fn state_name(state: char) -> &'static str {
 }
 
 /// The name a process goes by in grants: `OWNER/NAME`.
-fn resource_of(owner: &str, process: &Proc) -> String {
+pub(super) fn resource_of(owner: &str, process: &Proc) -> String {
     format!("{owner}/{}", process.stat.comm)
 }
 

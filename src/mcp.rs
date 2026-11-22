@@ -21,9 +21,10 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::audit::{Severity, bounded_args};
+use crate::fleet::Fleet;
 use crate::policy::{Access, Principal};
 use crate::sanitize::{cap_text, clean_text};
-use crate::token::sha256_hex;
+use crate::token::{Secret, sha256_hex};
 use crate::tools::args::{Args, input_schema};
 use crate::tools::{Call, Ctx, Host, Registry, Tool, ToolError};
 
@@ -44,17 +45,119 @@ const QUEUE_WAIT: Duration = Duration::from_secs(30);
 /// Largest audit `args` field, in bytes.
 const MAX_AUDIT_ARGS: usize = 3000;
 
+/// The key in a request's `_meta` under which a fleet server describes a call it is
+/// passing on: `{"read_only": bool, "gateway": "...", "caller": "...", "call": "..."}`.
+pub const VIA_META: &str = "opsmcp/via";
+/// Longest `gateway`, `caller` or `call` accepted, in characters.
+const MAX_CLAIM_CHARS: usize = 128;
+
+/// What a request carried under `_meta["opsmcp/via"]`.
+#[derive(Debug, Default, PartialEq)]
+pub struct Passed {
+    /// Hold this request to tools that change nothing.
+    pub read_only: bool,
+    /// The names it gave (`gateway`, `caller`, `call`), for the audit trail.
+    pub claim: Option<Value>,
+}
+
+/// Reads `_meta["opsmcp/via"]` from a request's parameters.
+///
+/// AIDEV-NOTE: two different kinds of thing arrive here, and they are trusted
+/// differently on purpose.
+///   - `read_only` asks for LESS than the caller could have. Honouring it can never give
+///     anyone more, so it is honoured from any caller, with no configuration.
+///   - `gateway`, `caller` and `call` are what the sender says about where the call came
+///     from. They are written to the audit trail under `via`, beside the authenticated
+///     principal, and are used for nothing else. Never use them in a decision.
+///
+/// Anything malformed is an error, not something to skip: a `read_only` that was sent
+/// and could not be read must not quietly become "not read-only".
+pub fn passed(params: Option<&Value>) -> Result<Passed, String> {
+    let Some(value) = params
+        .and_then(|p| p.get("_meta"))
+        .and_then(|meta| meta.get(VIA_META))
+    else {
+        return Ok(Passed::default());
+    };
+    let wrong = |what: &str| format!("Invalid params: _meta {VIA_META:?} {what}");
+    let fields = value
+        .as_object()
+        .ok_or_else(|| wrong("must be an object"))?;
+    let mut passed = Passed::default();
+    let mut claim = serde_json::Map::new();
+    for (key, value) in fields {
+        match key.as_str() {
+            "read_only" => {
+                passed.read_only = value
+                    .as_bool()
+                    .ok_or_else(|| wrong("read_only must be true or false"))?;
+            }
+            "gateway" | "caller" | "call" => {
+                let text = value
+                    .as_str()
+                    .filter(|text| {
+                        !text.is_empty()
+                            && text.chars().count() <= MAX_CLAIM_CHARS
+                            && !text.contains(['\n', '\t'])
+                            && clean_text(text.as_bytes()) == *text
+                    })
+                    .ok_or_else(|| {
+                        wrong("gateway, caller and call must be short, plain, one-line strings")
+                    })?;
+                claim.insert(key.clone(), json!(text));
+            }
+            _ => return Err(wrong("has a field this server does not know")),
+        }
+    }
+    if !claim.is_empty() {
+        passed.claim = Some(Value::Object(claim));
+    }
+    Ok(passed)
+}
+
 /// Who a transport has authenticated, and how they are connected.
 #[derive(Clone)]
 pub struct Session {
     pub principal: Arc<Principal>,
     pub transport: &'static str,
     pub peer: Option<String>,
+    /// Only tools that change nothing may be used (`--read-only`).
+    pub read_only: bool,
+    /// The bearer token the caller presented. Kept only by a fleet server, which may be
+    /// configured to pass it on to the hosts; `None` everywhere else.
+    pub bearer: Option<Secret>,
+    /// Set by a fleet server that runs AS the caller (stdio, not through sudo): `ssh`
+    /// started by it then logs in with the caller's own keys and agent.
+    pub own_ssh: Option<OwnSsh>,
+}
+
+/// The caller's own SSH identity, for a fleet server that runs as the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnSsh {
+    /// The caller's agent socket (`SSH_AUTH_SOCK`), if they have one.
+    pub agent: Option<std::path::PathBuf>,
+}
+
+impl Session {
+    pub fn new(principal: Principal, transport: &'static str, peer: Option<String>) -> Session {
+        Session {
+            principal: Arc::new(principal),
+            transport,
+            peer,
+            read_only: false,
+            bearer: None,
+            own_ssh: None,
+        }
+    }
 }
 
 pub struct Server {
     host: Arc<Host>,
     registry: Registry,
+    /// Set for a fleet server: tools are then not run here but passed on to hosts.
+    fleet: Option<Arc<Fleet>>,
+    /// Every session is held to tools that change nothing (`--read-only`).
+    read_only: bool,
     slots: Semaphore,
     call_prefix: String,
     call_counter: AtomicU64,
@@ -68,14 +171,35 @@ impl Server {
         Server {
             host,
             registry,
+            fleet: None,
+            read_only: false,
             slots,
             call_prefix,
             call_counter: AtomicU64::new(0),
         }
     }
 
+    /// A server in front of a fleet: it speaks the same protocol, and every tool call is
+    /// handed to `fleet`, which passes it on to the hosts.
+    pub fn for_fleet(host: Arc<Host>, fleet: Arc<Fleet>) -> Server {
+        let mut server = Server::new(host, Registry::default());
+        server.fleet = Some(fleet);
+        server
+    }
+
+    /// Holds every session of this server to tools that change nothing.
+    pub fn read_only(mut self, read_only: bool) -> Server {
+        self.read_only = read_only;
+        self
+    }
+
     pub fn host(&self) -> &Arc<Host> {
         &self.host
+    }
+
+    /// Whether this is a fleet server, which may need a caller's own token to pass on.
+    pub fn is_fleet(&self) -> bool {
+        self.fleet.is_some()
     }
 
     /// Handles one payload from a client: a JSON-RPC message or a batch of them.
@@ -173,12 +297,24 @@ impl Server {
         // importantly, never dispatched: a tool only ever runs for a request.
         let id = id?;
         let params = fields.get("params");
-        let outcome = match method {
-            "initialize" => Ok(self.initialize(params)),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(self.list_tools(session)),
-            "tools/call" => self.call_tool(session, params).await,
-            other => Err((-32601, format!("Method not found: {}", short(other)))),
+        let held;
+        let session = if self.read_only && !session.read_only {
+            held = Session {
+                read_only: true,
+                ..session.clone()
+            };
+            &held
+        } else {
+            session
+        };
+        let outcome = match (method, &self.fleet) {
+            ("initialize", _) => Ok(self.initialize(params)),
+            ("ping", _) => Ok(json!({})),
+            ("tools/list", None) => self.list_tools(session, params),
+            ("tools/call", None) => self.call_tool(session, params).await,
+            ("tools/list", Some(fleet)) => fleet.list_tools(session, params),
+            ("tools/call", Some(fleet)) => fleet.call_tool(session, params).await,
+            (other, _) => Err((-32601, format!("Method not found: {}", short(other)))),
         };
         Some(match outcome {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -200,16 +336,26 @@ impl Server {
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "opsmcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": INSTRUCTIONS,
+            "instructions": match &self.fleet {
+                Some(fleet) => fleet.instructions(),
+                None => INSTRUCTIONS,
+            },
         })
     }
 
-    fn list_tools(&self, session: &Session) -> Value {
+    fn list_tools(
+        &self,
+        session: &Session,
+        params: Option<&Value>,
+    ) -> Result<Value, (i64, String)> {
+        let passed = passed(params).map_err(|message| (-32602, message))?;
+        let read_only = session.read_only || passed.read_only;
         let rules = &session.principal.rules;
         let tools: Vec<Value> = self
             .registry
             .tools()
             .filter(|tool| rules.may_use(&tool.permission, tool.access))
+            .filter(|tool| !(read_only && tool.access == Access::Write))
             .map(|tool| {
                 let read_only = tool.access == Access::Read;
                 json!({
@@ -224,7 +370,7 @@ impl Server {
                 })
             })
             .collect();
-        json!({"tools": tools})
+        Ok(json!({"tools": tools}))
     }
 
     async fn call_tool(
@@ -246,6 +392,7 @@ impl Server {
             .get(name)
             .ok_or_else(|| (-32602, format!("Unknown tool: {}", short(name))))?;
         let arguments = params.and_then(|p| p.get("arguments"));
+        let passed = passed(params).map_err(|message| (-32602, message))?;
 
         // AIDEV-NOTE: the audit record carries the arguments exactly as sent when they
         // fit. When they do not, a read is recorded with shortened arguments and the hash
@@ -274,6 +421,8 @@ impl Server {
             access: tool.access,
             args: recorded,
             args_sha256,
+            read_only: session.read_only || passed.read_only,
+            via: passed.claim,
         });
         let ctx = Ctx::new(self.host.clone(), call.clone());
 
@@ -310,6 +459,16 @@ impl Server {
                 principal.name,
                 tool.permission,
                 tool.access.as_str(),
+                tool.name
+            );
+            return (message, Outcome::Denied);
+        }
+        // AIDEV-NOTE: a read-only session (or a request that asked to be held to one)
+        // never reaches a tool that changes things, whatever the caller's grants are.
+        if ctx.read_only() && tool.access == Access::Write {
+            let _ = ctx.audit_decision(None, false, Some("the session is read-only"));
+            let message = format!(
+                "Refused: this session is read-only, and {} changes things.",
                 tool.name
             );
             return (message, Outcome::Denied);
@@ -636,11 +795,7 @@ max_concurrent_calls = 2
                 .cfg
                 .principal_for_unix(user, &[])
                 .unwrap();
-            Session {
-                principal: Arc::new(principal),
-                transport: "test",
-                peer: None,
-            }
+            Session::new(principal, "test", None)
         }
 
         pub async fn send(&self, user: &str, message: Value) -> Option<Value> {
@@ -776,6 +931,184 @@ mod tests {
         assert!(!names(&reader).contains(&"touch".to_string()));
         let writer = fx.request("walt", "tools/list", json!({})).await;
         assert!(names(&writer).contains(&"touch".to_string()));
+    }
+
+    // ---- read-only sessions, and calls passed on by a fleet server ----
+
+    /// Sends one request in the given session and returns its result or its error.
+    async fn ask(fx: &Fixture, session: &Session, method: &str, params: Value) -> Value {
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let payload = serde_json::to_vec(&message).unwrap();
+        fx.server.handle(session, &payload).await.unwrap()
+    }
+
+    fn text_of(reply: &Value) -> (String, bool) {
+        let result = &reply["result"];
+        (
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"))
+                .to_string(),
+            result["isError"].as_bool().unwrap(),
+        )
+    }
+
+    fn via(fields: Value) -> Value {
+        json!({"opsmcp/via": fields})
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_is_not_offered_and_cannot_use_tools_that_change_things() {
+        let fx = Fixture::new();
+        let mut session = fx.session("walt");
+        session.read_only = true;
+        let listed = ask(&fx, &session, "tools/list", json!({})).await;
+        let listed = names(&listed["result"]);
+        assert!(listed.contains(&"echo".to_string()), "{listed:?}");
+        assert!(!listed.contains(&"touch".to_string()), "{listed:?}");
+
+        let call = json!({"name": "touch", "arguments": {"name": "alpha1"}});
+        let (text, is_error) = text_of(&ask(&fx, &session, "tools/call", call).await);
+        assert!(is_error);
+        assert!(text.contains("read-only"), "{text}");
+        assert!(fx.touched().is_empty());
+        let record = &fx.audited("tool_call")[0];
+        assert_eq!(record["decision"], "deny");
+        assert!(
+            record["reason"].as_str().unwrap().contains("read-only"),
+            "{record}"
+        );
+        assert_eq!(record["read_only"], true);
+        assert_eq!(fx.audited("tool_result")[0]["outcome"], "denied");
+
+        // reading still works
+        let call = json!({"name": "echo", "arguments": {"text": "hi"}});
+        assert_eq!(
+            text_of(&ask(&fx, &session, "tools/call", call).await),
+            ("hi".to_string(), false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_can_ask_to_be_held_to_read_only() {
+        let fx = Fixture::new();
+        let session = fx.session("walt");
+        let call = json!({"name": "touch", "arguments": {"name": "alpha1"},
+            "_meta": via(json!({"read_only": true}))});
+        let (text, is_error) = text_of(&ask(&fx, &session, "tools/call", call).await);
+        assert!(is_error && text.contains("read-only"), "{text}");
+        assert!(fx.touched().is_empty());
+        // the same call without the request goes through
+        let call = json!({"name": "touch", "arguments": {"name": "alpha1"}});
+        assert!(!text_of(&ask(&fx, &session, "tools/call", call).await).1);
+        assert_eq!(fx.touched(), ["alpha1"]);
+        // and the listing honours it too
+        let listed = ask(
+            &fx,
+            &session,
+            "tools/list",
+            json!({"_meta": via(json!({"read_only": true}))}),
+        )
+        .await;
+        assert!(!names(&listed["result"]).contains(&"touch".to_string()));
+        let listed = ask(&fx, &session, "tools/list", json!({})).await;
+        assert!(names(&listed["result"]).contains(&"touch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_call_cannot_ask_its_way_out_of_a_read_only_session() {
+        let fx = Fixture::new();
+        let mut session = fx.session("walt");
+        session.read_only = true;
+        let call = json!({"name": "touch", "arguments": {"name": "alpha1"},
+            "_meta": via(json!({"read_only": false}))});
+        let (text, is_error) = text_of(&ask(&fx, &session, "tools/call", call).await);
+        assert!(is_error && text.contains("read-only"), "{text}");
+        assert!(fx.touched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_a_fleet_server_says_about_a_call_is_recorded_as_its_claim() {
+        let fx = Fixture::new();
+        let session = fx.session("walt");
+        let claim = json!({"gateway": "bastion1", "caller": "token:sean", "call": "9f3c2a11-7"});
+        let call =
+            json!({"name": "touch", "arguments": {"name": "alpha1"}, "_meta": via(claim.clone())});
+        assert!(!text_of(&ask(&fx, &session, "tools/call", call).await).1);
+        let record = &fx.audited("tool_call")[0];
+        // who is really calling is unchanged: the claim sits beside it, never instead
+        assert_eq!(record["principal"], "walt");
+        assert_eq!(record["via"], claim);
+        assert!(record.get("read_only").is_none(), "{record}");
+        // without a claim there is no such field
+        let call = json!({"name": "echo", "arguments": {"text": "x"}});
+        ask(&fx, &session, "tools/call", call).await;
+        assert!(fx.audited("tool_call")[1].get("via").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_claim_grants_nothing() {
+        let fx = Fixture::new();
+        // rita may only read; saying the call is for walt, or for root, changes nothing
+        let session = fx.session("rita");
+        for caller in ["walt", "root", "token:admin"] {
+            let call = json!({"name": "touch", "arguments": {"name": "alpha1"},
+                "_meta": via(json!({"gateway": "bastion1", "caller": caller}))});
+            let (text, is_error) = text_of(&ask(&fx, &session, "tools/call", call).await);
+            assert!(is_error && text.contains("Permission denied"), "{text}");
+        }
+        assert!(fx.touched().is_empty());
+        assert!(
+            fx.audited("tool_call")
+                .iter()
+                .all(|r| r["principal"] == "rita" && r["decision"] == "deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_claim_is_refused_not_ignored() {
+        let fx = Fixture::new();
+        let session = fx.session("walt");
+        let long = "x".repeat(200);
+        for bad in [
+            json!("read_only"),
+            json!(["read_only"]),
+            json!({"read_only": "yes"}),
+            json!({"read_only": 1}),
+            json!({"gateway": 7}),
+            json!({"caller": {"name": "sean"}}),
+            json!({"caller": long}),
+            json!({"caller": "sean\nroot"}),
+            json!({"call": "a\u{1b}[2J"}),
+            json!({"gateway": ""}),
+            json!({"unknown": true}),
+        ] {
+            let call = json!({"name": "touch", "arguments": {"name": "alpha1"}, "_meta": via(bad.clone())});
+            let reply = ask(&fx, &session, "tools/call", call).await;
+            assert_eq!(reply["error"]["code"], -32602, "{bad}: {reply}");
+            let listing = ask(
+                &fx,
+                &session,
+                "tools/list",
+                json!({"_meta": via(bad.clone())}),
+            )
+            .await;
+            assert_eq!(listing["error"]["code"], -32602, "{bad}: {listing}");
+        }
+        assert!(fx.touched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn other_request_metadata_is_left_alone() {
+        let fx = Fixture::new();
+        let session = fx.session("walt");
+        let call = json!({"name": "touch", "arguments": {"name": "alpha1"},
+            "_meta": {"progressToken": "abc", "example.com/other": {"read_only": true}}});
+        assert!(!text_of(&ask(&fx, &session, "tools/call", call).await).1);
+        assert_eq!(fx.touched(), ["alpha1"]);
+        // `_meta` that is not an object at all is not ours to judge either
+        let call = json!({"name": "echo", "arguments": {"text": "x"}, "_meta": "junk"});
+        assert!(!text_of(&ask(&fx, &session, "tools/call", call).await).1);
     }
 
     #[tokio::test]

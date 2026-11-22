@@ -38,10 +38,29 @@ allow = [
     "custom.haproxy_set",
 ]
 
-# For the people on call: lock an account, look at traffic. (@read does not include
-# packet_capture: it is tagged write so that reading traffic is always granted by name.)
+# For the people on call: lock an account and end its sessions, look at traffic, trace a
+# web process. (@read does not include packet_capture or process_trace: they are tagged
+# write so that reading traffic and attaching to processes are always granted by name.)
 [roles.incident]
-allow = ["@read", "user.modify", "net.capture:eth*"]
+allow = [
+    "@read",
+    "user.modify",
+    "user.session",
+    "net.capture:eth*",
+    "process.trace:www-data/*",
+]
+
+# For rolling maintenance of the web tier: quiet the monitoring, drain this host's
+# servers in HAProxy, edit and check the nginx configuration, free disk space.
+[roles.web-maintenance]
+allow = [
+    "@read",
+    "monitoring.downtime",
+    "haproxy.server:web/*",
+    "fs.write:/etc/nginx/**",
+    "service.control:nginx.service",
+    "storage.reclaim:journal",
+]
 
 [roles.admin]
 allow = ["@all"]
@@ -122,6 +141,13 @@ read_roots = ["/etc", "/proc", "/sys", "/usr/local/etc"]
 # Never listed or read, in addition to the built-in list (shadow files, private keys,
 # SSH and cloud credentials, process environments...).
 deny = ["/etc/mysql/debian.cnf", "**/*.env"]
+# Directories whose files config_edit may replace. Empty: nothing can be written.
+# Whoever may write a directory that root runs things from (cron, systemd units, sudoers)
+# can become root, so list the directories of particular services, not all of /etc.
+# The account files, sudoers, PAM, opsmcp's own files and SSH keys are never written.
+write_roots = ["/etc/nginx", "/etc/haproxy"]
+# Where config_edit keeps the previous content of each file it changes.
+backup_dir = "/var/backups/opsmcp"
 
 [kernel]
 # sysctl names and /sys files that may be changed. Empty: none.
@@ -154,6 +180,49 @@ min_uid = 1000        # accounts below this uid are off limits
 protected = ["root"]  # account names (globs) that are off limits
 groups = ["www-data"] # groups whose membership may be changed (exact names). Empty: none
 manage_ssh_keys = false # true: keys may be added to and removed from authorized_keys
+
+[monitoring]
+# monitoring_downtime sets Icinga 2 downtimes for THIS host only. Leave icinga_url unset
+# and the tool refuses everything. Give the ApiUser only the schedule-downtime,
+# remove-downtime and query-Downtime permissions, each filtered to this host.
+# icinga_url = "https://icinga.example.com:5665"
+# icinga_user = "opsmcp-web1"
+# icinga_password_file = "/etc/opsmcp/icinga.password" # chmod 600; the password and nothing else
+# icinga_ca = "/etc/ssl/certs/example-ca.pem"          # default: this host's CA bundle
+# host = "web1.example.com"                            # default: the kernel's host name
+max_minutes = 240 # the longest downtime that can be set
+
+[haproxy]
+socket = "/run/haproxy/admin.sock" # the admin socket haproxy_servers and haproxy_server_state use
+
+[storage]
+# The space_reclaim actions allowed here: journal, package_cache, container_images,
+# core_dumps, tmpfiles. Empty: none.
+reclaim = ["journal", "package_cache"]
+# Logical volumes lvm_extend may grow, as VG/LV globs, and the most one call may add.
+extendable = ["vg0/var", "vg0/srv*"]
+max_extend_gb = 50
+
+[firewall]
+# Address sets firewall_set_member may change: nft/FAMILY/TABLE/SET or ipset/NAME.
+sets = ["nft/inet/filter/blocklist"]
+
+[trace]
+# Processes that process_trace and cpu_profile may attach to, as OWNER/NAME globs.
+# Empty: none.
+processes = ["www-data/*"]
+system_wide = false # true: cpu_profile may sample the whole host
+
+[db]
+# db_status runs fixed status queries only.
+# mysql_defaults_file = "/etc/mysql/debian.cnf" # credentials; default: socket authentication
+postgres_user = "postgres"                      # psql runs as this user when opsmcp is root
+# postgres_socket_dir = "/var/run/postgresql"
+# patroni_config = "/etc/patroni/patroni.yml"   # default: the usual locations
+show_queries = false # true: show the text of running queries (it can hold personal data)
+
+[package]
+cve_online = false # true: cve_status may ask the vendor's security service when told to
 
 [tools]
 # Built-in tools to switch off entirely on this host.

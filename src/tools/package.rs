@@ -325,14 +325,14 @@ pub fn unit_name(unix_secs: i64, random: [u8; 2]) -> String {
 
 /// Which package tools a host has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Family {
+pub(super) enum Family {
     /// dpkg and apt: Debian, Ubuntu.
     Apt,
     /// rpm with dnf or yum.
     Rpm,
 }
 
-fn family(ctx: &Ctx) -> Result<Family, ToolError> {
+pub(super) fn family(ctx: &Ctx) -> Result<Family, ToolError> {
     if ctx.bins().find("dpkg-query").is_ok() {
         Ok(Family::Apt)
     } else if ctx.bins().find("rpm").is_ok() {
@@ -345,7 +345,7 @@ fn family(ctx: &Ctx) -> Result<Family, ToolError> {
 }
 
 /// `dnf`, or `yum` on a host that has no dnf.
-fn dnf_name(ctx: &Ctx) -> Result<&'static str, ToolError> {
+pub(super) fn dnf_name(ctx: &Ctx) -> Result<&'static str, ToolError> {
     ["dnf", "yum"]
         .into_iter()
         .find(|name| ctx.bins().find(name).is_ok())
@@ -906,7 +906,7 @@ struct Job {
 }
 
 /// `active`, `inactive`, `failed`... or `unknown` if systemd would not say.
-async fn unit_state(ctx: &Ctx, service: &str) -> String {
+pub(super) async fn unit_state(ctx: &Ctx, service: &str) -> String {
     let Ok(systemctl) = ctx.command("systemctl") else {
         return "unknown".to_string();
     };
@@ -919,7 +919,7 @@ async fn unit_state(ctx: &Ctx, service: &str) -> String {
 }
 
 /// What a unit wrote, read back from the journal: the newest `room` bytes of it.
-async fn unit_output(ctx: &Ctx, service: &str, room: usize) -> String {
+pub(super) async fn unit_output(ctx: &Ctx, service: &str, room: usize) -> String {
     let elsewhere = format!(
         "[the output could not be read back; it is in the journal: journal_query unit={service}]\n"
     );

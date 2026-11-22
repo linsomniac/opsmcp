@@ -8,11 +8,23 @@ use serde_json::{Value, json};
 /// The type of a parameter and its bounds.
 #[derive(Clone, Debug)]
 pub enum Kind {
-    Str { max_len: usize },
-    Int { min: i64, max: i64 },
+    Str {
+        max_len: usize,
+    },
+    /// Text of several lines: the content of a file, or a piece of one.
+    Text {
+        max_len: usize,
+    },
+    Int {
+        min: i64,
+        max: i64,
+    },
     Bool,
     Choice(Vec<String>),
-    StrList { max_items: usize, max_len: usize },
+    StrList {
+        max_items: usize,
+        max_len: usize,
+    },
 }
 
 /// One declared tool parameter.
@@ -37,6 +49,16 @@ impl Param {
     /// A string of at most 1024 characters (see `max_len`).
     pub fn str(name: &str, description: &str) -> Param {
         Param::new(name, description, Kind::Str { max_len: 1024 })
+    }
+
+    /// Text that may run over several lines, of at most `max_len` characters.
+    ///
+    /// AIDEV-NOTE: the only parameter kind that accepts line breaks and tabs. It is for
+    /// text that ends up INSIDE a file (config_edit). Never use it for a value that
+    /// reaches a command line, a socket or a log line: there a line break is how one
+    /// value turns into two.
+    pub fn text(name: &str, description: &str, max_len: usize) -> Param {
+        Param::new(name, description, Kind::Text { max_len })
     }
 
     /// An integer within `min..=max`.
@@ -86,7 +108,9 @@ pub fn input_schema(params: &[Param]) -> Value {
     let mut required = Vec::new();
     for param in params {
         let mut property = match &param.kind {
-            Kind::Str { max_len } => json!({"type": "string", "maxLength": max_len}),
+            Kind::Str { max_len } | Kind::Text { max_len } => {
+                json!({"type": "string", "maxLength": max_len})
+            }
             Kind::Int { min, max } => json!({"type": "integer", "minimum": min, "maximum": max}),
             Kind::Bool => json!({"type": "boolean"}),
             Kind::Choice(values) => json!({"type": "string", "enum": values}),
@@ -188,6 +212,20 @@ fn checked_value(param: &Param, value: &Value) -> Result<Value, String> {
                 .ok_or_else(|| format!("argument {name:?} must be a string"))?;
             check_text(name, text, *max_len)?;
         }
+        Kind::Text { max_len } => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| format!("argument {name:?} must be a string"))?;
+            check_length(name, text, *max_len)?;
+            // Line feed, carriage return and tab are what text files are made of; no
+            // other control character is.
+            let allowed = |c: char| !c.is_control() || matches!(c, '\n' | '\r' | '\t');
+            if !text.chars().all(allowed) {
+                return Err(format!(
+                    "argument {name:?} contains a control character other than a line break or a tab"
+                ));
+            }
+        }
         Kind::Int { min, max } => {
             // JSON has one number type: 5.0 is as much an integer as 5.
             let whole = |f: f64| (f.fract() == 0.0 && f.abs() < 9.0e15).then_some(f as i64);
@@ -239,13 +277,18 @@ fn checked_value(param: &Param, value: &Value) -> Result<Value, String> {
 /// AIDEV-NOTE: no argument of any tool may contain a control character (NUL, newline,
 /// escape...). Nothing legitimate needs one, and it closes off a whole class of
 /// injection into command lines, log queries and the audit log.
-fn check_text(name: &str, text: &str, max_len: usize) -> Result<(), String> {
+fn check_length(name: &str, text: &str, max_len: usize) -> Result<(), String> {
     // Counted in characters, which is what `maxLength` in the schema means.
     if text.chars().count() > max_len {
         return Err(format!(
             "argument {name:?} is longer than {max_len} characters"
         ));
     }
+    Ok(())
+}
+
+fn check_text(name: &str, text: &str, max_len: usize) -> Result<(), String> {
+    check_length(name, text, max_len)?;
     if text.chars().any(char::is_control) {
         return Err(format!("argument {name:?} contains a control character"));
     }
@@ -428,6 +471,43 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_text_parameter_takes_line_breaks_and_tabs_and_no_other_control_character() {
+        let params = vec![Param::text("content", "Content", 20)];
+        let args = Args::parse(&params, Some(&json!({"content": "a = 1\n\tb = 2\r\n"}))).unwrap();
+        assert_eq!(args.str("content"), Some("a = 1\n\tb = 2\r\n"));
+        // an empty text is a text
+        assert!(Args::parse(&params, Some(&json!({"content": ""}))).is_ok());
+        for bad in ["a\u{0}b", "a\u{1b}[0m", "a\u{7f}", "a\u{8}b", "a\u{85}b"] {
+            let message = Args::parse(&params, Some(&json!({"content": bad}))).unwrap_err();
+            assert!(message.contains("content"), "{bad:?} gave {message:?}");
+        }
+        assert!(Args::parse(&params, Some(&json!({"content": "x".repeat(21)}))).is_err());
+        assert!(Args::parse(&params, Some(&json!({"content": 5}))).is_err());
+        // the schema shows it as a string with its length limit
+        assert_eq!(
+            input_schema(&params),
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Content", "maxLength": 20}
+                },
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn an_ordinary_string_parameter_still_refuses_line_breaks_and_tabs() {
+        let params = vec![Param::str("value", "Value")];
+        for bad in ["a\nb", "a\tb", "a\rb"] {
+            assert!(
+                Args::parse(&params, Some(&json!({"value": bad}))).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::{Ctx, Tool, ToolError, ToolResult, command_ok, command_text, required
 use crate::policy::Access;
 
 const IPTABLES_TABLES: [&str; 5] = ["filter", "nat", "mangle", "raw", "security"];
-const NFT_FAMILIES: [&str; 6] = ["inet", "ip", "ip6", "arp", "bridge", "netdev"];
+pub(super) const NFT_FAMILIES: [&str; 6] = ["inet", "ip", "ip6", "arp", "bridge", "netdev"];
 
 pub fn tools() -> Vec<Tool> {
     vec![

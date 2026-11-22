@@ -181,7 +181,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
 }
 
 /// The kernel writes spaces and other awkward bytes in mount paths as `\NNN` (octal).
-fn unescape_octal(text: &str) -> String {
+pub(super) fn unescape_octal(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

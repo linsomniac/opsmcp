@@ -1,0 +1,24 @@
+# The hosts a fleet server may reach (fleet.inventory). A host can only be reached by a
+# name listed here: what an agent sends picks entries from this file and is never used
+# as an address.
+#
+# Names are DNS names (letters, digits, '-', dots). Groups are named by callers and in
+# [[fleet.access]] rules as group:NAME.
+
+# The short way: groups and the hosts in them. A host needs no entry of its own.
+[groups]
+web = ["web1.example.com", "web2.example.com", "web3.example.com"]
+db = ["db1.example.com", "db2.example.com"]
+prod = ["web1.example.com", "web2.example.com", "db1.example.com"]
+
+# A host with settings of its own.
+[hosts."cache1.example.com"]
+address = "10.0.4.17" # what to connect to, if not the name: a DNS name or an IP address
+groups = ["cache"]
+# ssh_port = 2222
+# https_port = 9443
+
+# The same as JSON, for `fleet.inventory_command` or a .json file:
+#
+#   {"groups": {"web": ["web1.example.com"]},
+#    "hosts": {"cache1.example.com": {"address": "10.0.4.17", "groups": ["cache"]}}}

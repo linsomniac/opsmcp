@@ -157,7 +157,7 @@ pub fn protected_by(cfg: &ServicesCfg, names: &[&str]) -> Option<String> {
 }
 
 /// Asks systemd for a unit's real name (`Id`) and whether it exists (`LoadState`).
-async fn lookup(ctx: &Ctx, unit: &str) -> Result<(String, String), ToolError> {
+pub(super) async fn lookup(ctx: &Ctx, unit: &str) -> Result<(String, String), ToolError> {
     let show = ctx
         .run(ctx.command("systemctl")?.args([
             "show",
@@ -188,7 +188,10 @@ async fn lookup(ctx: &Ctx, unit: &str) -> Result<(String, String), ToolError> {
 /// ssh.service). systemd is asked for the unit's real name first; the protected list is
 /// checked against both names, and the caller's grant and the action itself use the real
 /// one. Grants should therefore be written with real unit names.
-async fn authorize_change(ctx: &Ctx, asked: &str) -> Result<(String, Authorized), ToolError> {
+pub(super) async fn authorize_change(
+    ctx: &Ctx,
+    asked: &str,
+) -> Result<(String, Authorized), ToolError> {
     let unit = normalize_unit(asked)?;
     let (id, load_state) = lookup(ctx, &unit).await?;
 

@@ -163,7 +163,7 @@ pub fn denied_by(cfg: &FsCfg, real: &str) -> Option<String> {
 /// True when `real` lies in one of the configured directories. A configured directory
 /// may itself be reached through a link (/var/run, a moved /var/log...), so the path is
 /// compared with where each one really is as well as with how it was written.
-fn inside(real: &str, roots: &[PathBuf]) -> bool {
+pub(super) fn inside(real: &str, roots: &[PathBuf]) -> bool {
     let real_roots: Vec<PathBuf> = roots
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())

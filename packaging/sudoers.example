@@ -8,3 +8,14 @@
 # start it grants nothing by itself: a user with no role is turned away.
 
 %ops ALL=(root) NOPASSWD: /usr/bin/opsmcp serve
+
+# On a bastion that runs a fleet server with keys only root can read (rules with
+# identity = "fleet" in /etc/opsmcp/fleet.toml): let them start it, and nothing else.
+# opsmcp applies the roles of the user who invoked sudo there too. Under sudo, rules that
+# reuse the caller's own SSH identity never apply: the process is root, not the caller.
+#
+# %ops ALL=(root) NOPASSWD: /usr/bin/opsmcp fleet
+
+# With `--read-only`, each form is its own exact command line and needs its own line:
+#
+# %ops ALL=(root) NOPASSWD: /usr/bin/opsmcp serve --read-only

@@ -176,6 +176,69 @@ pub async fn run(cmd: Cmd) -> Result<CmdOutput, String> {
     })
 }
 
+/// A long-running program whose stdin, stdout and stderr are connected to us: how the
+/// fleet server holds an `ssh` session to a host.
+pub struct Piped {
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+    pub stderr: tokio::process::ChildStderr,
+    pub process: PipedProcess,
+}
+
+/// The running program itself. Dropping it kills the program's whole process group.
+pub struct PipedProcess {
+    child: tokio::process::Child,
+    group: GroupGuard,
+}
+
+impl PipedProcess {
+    /// Waits for the program to end by itself.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        // It ended by itself: whatever it left running is not ours to kill.
+        self.group.disarm();
+        Ok(status)
+    }
+}
+
+/// Starts a program that stays running, with pipes to its stdin, stdout and stderr.
+///
+/// AIDEV-NOTE: the same rules as `run`, except that stdin is a pipe and there is no time
+/// limit here: never a shell, a clean and fixed environment, the working directory `/`,
+/// its own process group, and everything it started is killed when the `PipedProcess`
+/// is dropped. `timeout`, `max_output` and `run_as` of the `Cmd` are not used.
+pub fn spawn_piped(cmd: &Cmd) -> Result<Piped, String> {
+    let mut command = tokio::process::Command::new(&cmd.program);
+    command
+        .args(&cmd.args)
+        .env_clear()
+        .env("PATH", &cmd.path_env)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", cmd.program.display()))?;
+    let group = GroupGuard::new(child.id());
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        return Err(format!("cannot connect to {}", cmd.program.display()));
+    };
+    Ok(Piped {
+        stdin,
+        stdout,
+        stderr,
+        process: PipedProcess { child, group },
+    })
+}
+
 const PIPE_LINGER: Duration = Duration::from_millis(250);
 const REAP_WAIT: Duration = Duration::from_secs(2);
 
@@ -452,6 +515,76 @@ mod tests {
             Ok(stat) => !stat.contains(") Z "),
             Err(_) => false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_piped_program_answers_on_stdout_what_it_is_sent_on_stdin() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut piped = spawn_piped(&sh("while read line; do echo \"got $line\"; done")).unwrap();
+        let mut lines = BufReader::new(piped.stdout).lines();
+        for word in ["one", "two"] {
+            piped
+                .stdin
+                .write_all(format!("{word}\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                format!("got {word}")
+            );
+        }
+        // closing its stdin lets it end, and its exit status can be collected
+        drop(piped.stdin);
+        let status = tokio::time::timeout(Duration::from_secs(5), piped.process.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_piped_program_gets_the_same_clean_environment_as_any_other() {
+        use tokio::io::AsyncReadExt;
+        assert!(std::env::var("CARGO_MANIFEST_DIR").is_ok());
+        let mut cmd =
+            sh("echo \"[$CARGO_MANIFEST_DIR][$HOME][$LC_ALL][$EXTRA]\"; pwd; echo oops >&2");
+        cmd.env.push(("EXTRA".to_string(), "yes".to_string()));
+        let mut piped = spawn_piped(&cmd).unwrap();
+        let (mut out, mut err) = (String::new(), String::new());
+        piped.stdout.read_to_string(&mut out).await.unwrap();
+        piped.stderr.read_to_string(&mut err).await.unwrap();
+        assert_eq!(out, "[][][C][yes]\n/\n");
+        assert_eq!(err, "oops\n");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_piped_program_kills_everything_it_started() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let piped = spawn_piped(&sh("sleep 300 & echo $!; echo $$; wait")).unwrap();
+        let mut lines = BufReader::new(piped.stdout).lines();
+        let child = lines.next_line().await.unwrap().unwrap();
+        let shell = lines.next_line().await.unwrap().unwrap();
+        assert!(alive(&child) && alive(&shell));
+        drop(piped.process);
+        for _ in 0..100 {
+            if !alive(&child) && !alive(&shell) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "still running: sleep {} shell {}",
+            alive(&child),
+            alive(&shell)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_piped_program_that_cannot_be_started_is_an_error() {
+        let error = spawn_piped(&Cmd::new("/nonexistent/program"))
+            .err()
+            .unwrap();
+        assert!(error.contains("/nonexistent/program"), "{error}");
     }
 
     #[tokio::test]

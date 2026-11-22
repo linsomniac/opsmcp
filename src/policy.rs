@@ -99,6 +99,16 @@ impl Grant {
         })
     }
 
+    /// The resource the grant is limited to, if it is limited to one.
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
+    }
+
+    /// True when the grant names operator-defined tools (`custom.NAME`, `custom.*`).
+    pub fn is_for_custom_tools(&self) -> bool {
+        matches!(&self.permission, PermissionPattern::Glob(pattern) if pattern.starts_with("custom."))
+    }
+
     /// True when the permission part covers this permission, ignoring any resource.
     pub fn covers_permission(&self, permission: &str, access: Access) -> bool {
         match &self.permission {
@@ -144,6 +154,11 @@ pub struct Rules {
 impl Rules {
     pub fn new(allow: Vec<Grant>, deny: Vec<Grant>) -> Rules {
         Rules { allow, deny }
+    }
+
+    /// Whether there is any allow grant at all. Rules without one permit nothing.
+    pub fn allows_anything(&self) -> bool {
+        !self.allow.is_empty()
     }
 
     /// Whether a deny grant covers this resource. For filtering what a collection

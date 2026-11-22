@@ -6,6 +6,7 @@
 mod audit;
 mod config;
 mod exec;
+mod fleet;
 mod glob;
 mod http;
 mod identity;
@@ -61,6 +62,26 @@ struct ServeArgs {
     /// Log more to stderr
     #[arg(short, long)]
     verbose: bool,
+    /// Offer and run only tools that change nothing
+    #[arg(long)]
+    read_only: bool,
+}
+
+/// Where a fleet server's configuration is unless `--config` says otherwise. A machine
+/// that is both a fleet server and a host has both files.
+const DEFAULT_FLEET_CONFIG_PATH: &str = "/etc/opsmcp/fleet.toml";
+
+#[derive(Args)]
+struct FleetArgs {
+    /// Configuration file (one with a [fleet] section)
+    #[arg(long, value_name = "FILE", default_value = DEFAULT_FLEET_CONFIG_PATH)]
+    config: PathBuf,
+    /// Log more to stderr
+    #[arg(short, long)]
+    verbose: bool,
+    /// Offer and pass on only tools that change nothing
+    #[arg(long)]
+    read_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -69,6 +90,10 @@ enum Command {
     Serve(ServeArgs),
     /// Serve MCP over HTTPS, as configured under [http]
     ServeHttp(ServeArgs),
+    /// Serve a fleet of hosts on stdin and stdout: one connection that reaches them all
+    Fleet(FleetArgs),
+    /// Serve a fleet of hosts over HTTPS, as configured under [http]
+    FleetHttp(FleetArgs),
     /// Check the configuration and summarise who may do what
     CheckConfig(ConfigArg),
     /// List every tool with its access class and permission
@@ -88,6 +113,8 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Serve(args) => serve_stdio(&args),
         Command::ServeHttp(args) => serve_http(&args),
+        Command::Fleet(args) => fleet_stdio(&args),
+        Command::FleetHttp(args) => fleet_http(&args),
         Command::CheckConfig(arg) => check_config(&arg.config),
         Command::Tools(arg) => list_tools(&arg.config),
         Command::Whoami(arg) => whoami(&arg.config),
@@ -163,19 +190,55 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 
 /// Completes when the process is asked to stop (SIGTERM, SIGINT or SIGHUP).
 async fn shutdown_signal() {
+    stop_signal(true).await;
+}
+
+/// Completes when the process is asked to stop: SIGTERM, SIGINT and, with `on_hangup`,
+/// SIGHUP.
+///
+/// AIDEV-NOTE: SIGHUP means "stop" everywhere except in `opsmcp fleet-http`. A server on
+/// stdin and stdout belongs to a session, and a hang-up is that session ending. The
+/// fleet daemon has no session; there SIGHUP means what it means to most daemons, "read
+/// your lists again" (`reload_on_hangup`), and it does not stop.
+async fn stop_signal(on_hangup: bool) {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut terminate), Ok(mut interrupt), Ok(mut hangup)) = (
+    let (Ok(mut terminate), Ok(mut interrupt)) = (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
-        signal(SignalKind::hangup()),
     ) else {
         log::warn!("cannot listen for termination signals");
         return std::future::pending().await;
     };
+    let hangup = async {
+        if on_hangup && let Ok(mut hangup) = signal(SignalKind::hangup()) {
+            hangup.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     tokio::select! {
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
-        _ = hangup.recv() => {}
+        () = hangup => {}
+    }
+}
+
+/// Has the fleet's inventory read again whenever the process gets SIGHUP. Call inside
+/// the runtime, before serving: from here on a SIGHUP no longer ends the process.
+fn reload_on_hangup(asked: Arc<tokio::sync::Notify>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::hangup()) {
+        Ok(mut hangup) => {
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    asked.notify_one();
+                    log::info!("SIGHUP: reading the inventory again");
+                }
+            });
+        }
+        Err(e) => log::warn!(
+            "cannot listen for SIGHUP ({e}): the inventory is only read again on its schedule"
+        ),
     }
 }
 
@@ -205,10 +268,36 @@ fn ssh_peer() -> Option<String> {
     Some(address.to_string())
 }
 
+/// A fleet configuration decides who may reach which hosts; its grants mean something
+/// else than a host's (they are never limited to a resource). Neither kind of server
+/// starts with the other's file.
+fn not_a_fleet_configuration(loaded: &Loaded, path: &Path) -> Result<(), String> {
+    if loaded.cfg.fleet.is_some() {
+        return Err(format!(
+            "{} has a [fleet] section: it configures a fleet server; start that with \
+             `opsmcp fleet` or `opsmcp fleet-http`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn a_fleet_configuration(loaded: &Loaded, path: &Path) -> Result<(), String> {
+    if loaded.cfg.fleet.is_none() {
+        return Err(format!(
+            "{} has no [fleet] section: it does not configure a fleet server (for a host, \
+             use `opsmcp serve`)",
+            path.display()
+        ));
+    }
+    fleet::setup::check_registry(&loaded.registry)
+}
+
 fn serve_stdio(args: &ServeArgs) -> Result<(), String> {
     logging::init(args.verbose);
     let me = identity::current()?;
     let loaded = load(&args.config.config)?;
+    not_a_fleet_configuration(&loaded, &args.config.config)?;
     for warning in &loaded.warnings {
         log::warn!("{warning}");
     }
@@ -224,16 +313,15 @@ fn serve_stdio(args: &ServeArgs) -> Result<(), String> {
             )
         })?;
     let host = build_host(loaded.cfg)?;
-    let server = Arc::new(Server::new(host.clone(), loaded.registry));
-    let session = Session {
-        principal: Arc::new(principal),
-        transport: "stdio",
-        peer: ssh_peer(),
-    };
+    let server = Arc::new(Server::new(host.clone(), loaded.registry).read_only(args.read_only));
+    let session = Session::new(principal, "stdio", ssh_peer());
 
     let runtime = runtime()?;
     let result = runtime.block_on(async {
-        let details = json!({"uid": me.uid, "via_sudo": me.via_sudo});
+        let mut details = json!({"uid": me.uid, "via_sudo": me.via_sudo});
+        if args.read_only {
+            details["read_only"] = json!(true);
+        }
         session_event(&host, &session, "session_start", details)
             .map_err(|e| format!("cannot write to the audit log, so not serving: {e}"))?;
         log::debug!("serving {} on stdio", session.principal.name);
@@ -257,13 +345,150 @@ fn serve_stdio(args: &ServeArgs) -> Result<(), String> {
 fn serve_http(args: &ServeArgs) -> Result<(), String> {
     logging::init(args.verbose);
     let loaded = load(&args.config.config)?;
+    not_a_fleet_configuration(&loaded, &args.config.config)?;
     for warning in &loaded.warnings {
         log::warn!("{warning}");
     }
     let host = build_host(loaded.cfg)?;
-    let server = Arc::new(Server::new(host, loaded.registry));
+    let server = Arc::new(Server::new(host, loaded.registry).read_only(args.read_only));
     let runtime = runtime()?;
     let result = runtime.block_on(http::serve(server, shutdown_signal()));
+    runtime.shutdown_background();
+    result
+}
+
+/// How often sessions to hosts that have gone unused are looked for and closed.
+const REAP_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Reads the inventory and credentials and builds the fleet server. Run inside the
+/// runtime: an inventory may come from a command. The inventory is looked at again
+/// from then on, on its schedule and whenever `reload` is notified.
+async fn build_fleet(
+    host: &Arc<Host>,
+    registry: Registry,
+    reload: Arc<tokio::sync::Notify>,
+) -> Result<Arc<fleet::Fleet>, String> {
+    let prepared = fleet::setup::prepare(&host.cfg, &host.bins).await?;
+    for warning in &prepared.warnings {
+        log::warn!("{warning}");
+    }
+    let (fleet, refresher) = fleet::setup::assemble(host.clone(), registry, prepared);
+    tokio::spawn(refresher.run(reload));
+    let reaping = fleet.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REAP_EVERY);
+        loop {
+            tick.tick().await;
+            reaping.reap().await;
+        }
+    });
+    Ok(fleet)
+}
+
+fn fleet_stdio(args: &FleetArgs) -> Result<(), String> {
+    logging::init(args.verbose);
+    let me = identity::current()?;
+    let loaded = load(&args.config)?;
+    a_fleet_configuration(&loaded, &args.config)?;
+    for warning in &loaded.warnings {
+        log::warn!("{warning}");
+    }
+    let principal = loaded
+        .cfg
+        .principal_for_unix(&me.user, &me.groups)
+        .ok_or_else(|| {
+            format!(
+                "user {} has no role in {}; nothing to serve",
+                me.user,
+                args.config.display()
+            )
+        })?;
+    let host = build_host(loaded.cfg)?;
+    let mut session = Session::new(principal, "stdio", ssh_peer());
+    // AIDEV-NOTE: a rule with `identity = "caller"` makes `ssh` log in as whoever this
+    // process runs as. That is the caller only when the caller started it themselves.
+    // Under sudo the process is root and the caller is someone else: root's keys are
+    // not the caller's identity, so such rules must not apply (and the caller's agent,
+    // which sudo does not pass on anyway, is not used).
+    let runs_as_caller = !me.via_sudo && rustix::process::geteuid().as_raw() == me.uid;
+    if runs_as_caller {
+        let agent = std::env::var("SSH_AUTH_SOCK").ok();
+        session.own_ssh = Some(mcp::OwnSsh {
+            agent: fleet::setup::agent_socket(agent.as_deref()),
+        });
+    }
+
+    if !runs_as_caller {
+        log::info!(
+            "running through sudo: rules that reuse the caller's own SSH identity do not \
+             apply, only those with identity = \"fleet\""
+        );
+    }
+
+    let runtime = runtime()?;
+    let result = runtime.block_on(async {
+        // Nobody notifies this one: on stdio a SIGHUP ends the session, and the
+        // inventory is read again on its schedule only.
+        let reload = Arc::new(tokio::sync::Notify::new());
+        let fleet = build_fleet(&host, loaded.registry, reload).await?;
+        let server =
+            Arc::new(Server::for_fleet(host.clone(), fleet.clone()).read_only(args.read_only));
+        let mut details = json!({"uid": me.uid, "via_sudo": me.via_sudo, "fleet": true});
+        if args.read_only {
+            details["read_only"] = json!(true);
+        }
+        session_event(&host, &session, "session_start", details)
+            .map_err(|e| format!("cannot write to the audit log, so not serving: {e}"))?;
+        log::debug!("serving the fleet to {} on stdio", session.principal.name);
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let served = stdio::serve(
+            server,
+            session.clone(),
+            stdin,
+            tokio::io::stdout(),
+            shutdown_signal(),
+        )
+        .await;
+        // Let the hosts end their sessions cleanly before we go.
+        fleet.shutdown().await;
+        let _ = session_event(&host, &session, "session_end", json!({}));
+        served.map_err(|e| format!("stdio: {e}"))
+    });
+    runtime.shutdown_background();
+    result
+}
+
+fn fleet_http(args: &FleetArgs) -> Result<(), String> {
+    logging::init(args.verbose);
+    let loaded = load(&args.config)?;
+    a_fleet_configuration(&loaded, &args.config)?;
+    for warning in &loaded.warnings {
+        log::warn!("{warning}");
+    }
+    // Callers over HTTPS have no SSH identity of their own to reuse; say so once rather
+    // than leave an operator wondering why a rule never applies.
+    if let Some(fleet) = &loaded.cfg.fleet {
+        for (index, rule) in fleet.access.iter().enumerate() {
+            if rule.via == config::Via::Ssh && rule.identity == config::IdentityMode::Caller {
+                log::warn!(
+                    "fleet.access rule {} reuses the caller's own SSH identity, which callers \
+                     over HTTPS do not have: it never applies under `opsmcp fleet-http`",
+                    rule.label(index)
+                );
+            }
+        }
+    }
+    let host = build_host(loaded.cfg)?;
+    let runtime = runtime()?;
+    let result = runtime.block_on(async {
+        let reload = Arc::new(tokio::sync::Notify::new());
+        reload_on_hangup(reload.clone());
+        let fleet = build_fleet(&host, loaded.registry, reload).await?;
+        let server = Arc::new(Server::for_fleet(host, fleet.clone()).read_only(args.read_only));
+        let served = http::serve(server, stop_signal(false)).await;
+        fleet.shutdown().await;
+        served
+    });
     runtime.shutdown_background();
     result
 }
@@ -300,6 +525,19 @@ fn check_config(path: &Path) -> Result<(), String> {
         && let Err(e) = http::check_tls(http)
     {
         unready.push(format!("http: {e}"));
+    }
+    // A fleet server: can the inventory and the credentials its rules name be read?
+    let mut fleet = None;
+    if cfg.fleet.is_some() {
+        if let Err(e) = fleet::setup::check_registry(&loaded.registry) {
+            unready.push(format!("fleet: {e}"));
+        }
+        let trust = rustix::process::geteuid().is_root().then(Vec::new);
+        let bins = Bins::new(&cfg.paths, trust);
+        match runtime()?.block_on(fleet::setup::prepare(cfg, &bins)) {
+            Ok(prepared) => fleet = Some(prepared),
+            Err(e) => unready.push(format!("fleet: {e}")),
+        }
     }
     if !unready.is_empty() {
         let list: Vec<String> = unready.iter().map(|e| format!("  - {e}")).collect();
@@ -406,9 +644,68 @@ fn check_config(path: &Path) -> Result<(), String> {
         }
     }
 
-    if !loaded.warnings.is_empty() {
+    let mut warnings = loaded.warnings.clone();
+    if let Some(prepared) = &fleet {
+        let _ = writeln!(
+            out,
+            "\nFleet: {} hosts in {} groups (it calls itself {:?} to them)",
+            prepared.inventory.len(),
+            prepared.inventory.groups().len(),
+            prepared.name
+        );
+        let _ = writeln!(out, "  Hosts come from {}.", prepared.source.describe());
+        let _ = writeln!(
+            out,
+            "  The first rule that fits a caller and a host decides:"
+        );
+        let rows: Vec<Vec<String>> = prepared
+            .rules
+            .rules()
+            .iter()
+            .map(|rule| {
+                let hosts = prepared
+                    .inventory
+                    .hosts()
+                    .filter(|host| rule.hosts.matches(host))
+                    .count();
+                let credential = match (rule.via, rule.identity) {
+                    (config::Via::Ssh, config::IdentityMode::Caller) => {
+                        "the caller's own keys and agent".to_string()
+                    }
+                    (config::Via::Https, config::IdentityMode::Caller) => {
+                        "the caller's own token, passed on".to_string()
+                    }
+                    (config::Via::Ssh, config::IdentityMode::Fleet) => format!(
+                        "account {} with a key of the fleet's",
+                        rule.ssh_user.as_deref().unwrap_or("?")
+                    ),
+                    (config::Via::Https, config::IdentityMode::Fleet) => {
+                        "a token of the fleet's".to_string()
+                    }
+                };
+                let mut roles: Vec<&str> = rule.roles.iter().map(String::as_str).collect();
+                roles.sort_unstable();
+                vec![
+                    rule.label.clone(),
+                    roles.join(", "),
+                    format!("{hosts} hosts"),
+                    rule.via.as_str().to_string(),
+                    credential,
+                    if rule.read_only { "read-only" } else { "" }.to_string(),
+                ]
+            })
+            .collect();
+        let headers = ["RULE", "ROLES", "HOSTS", "VIA", "CREDENTIAL", ""];
+        let table = format_table(&headers, &rows, &[false; 6]);
+        for line in table.lines() {
+            let _ = writeln!(out, "  {}", line.trim_end());
+        }
+        warnings.extend(prepared.warnings.iter().cloned());
+    }
+
+    if !warnings.is_empty() {
         let _ = writeln!(out, "\nWarnings:");
-        for warning in &loaded.warnings {
+        for warning in &warnings {
             let _ = writeln!(out, "  - {warning}");
         }
     }

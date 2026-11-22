@@ -30,6 +30,31 @@ pub fn generate() -> Result<NewToken, String> {
     Ok(NewToken { token, sha256 })
 }
 
+/// A credential held in memory: a bearer token that is passed on, or one read from a file.
+///
+/// AIDEV-NOTE: there is deliberately no `Display`, and `Debug` prints a placeholder, so a
+/// secret cannot end up in a log line, an error message or an audit record by way of a
+/// format string. The only way to the text is `expose`, which is easy to search for.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(text: impl Into<String>) -> Secret {
+        Secret(text.into())
+    }
+
+    /// The secret itself. Only for handing it to whatever it authenticates to.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[secret]")
+    }
+}
+
 /// Normalizes a SHA-256 written as hex, with or without `:` separators and in either
 /// case, to 64 lowercase hex digits. Returns `None` if it is not a SHA-256.
 pub fn normalize_sha256(text: &str) -> Option<String> {
@@ -74,5 +99,13 @@ mod tests {
         assert_eq!(normalize_sha256(&plain[..62]), None);
         assert_eq!(normalize_sha256(&plain.replace('b', "g")), None);
         assert_eq!(normalize_sha256(""), None);
+    }
+
+    #[test]
+    fn a_secret_does_not_show_itself_when_printed() {
+        let secret = Secret::new("opsmcp_hunter2");
+        assert_eq!(format!("{secret:?}"), "[secret]");
+        assert_eq!(format!("{:?}", Some(secret.clone())), "Some([secret])");
+        assert_eq!(secret.expose(), "opsmcp_hunter2");
     }
 }

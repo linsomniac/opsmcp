@@ -596,6 +596,13 @@ fn authenticate(shared: &Shared, conn: &Conn, headers: &HeaderMap) -> Result<Ses
         AuthMode::Mtls => by_cert(),
         // The handshake has already required a certificate from the CA; this is a
         // second check that it is there. The token then says who the caller is.
+        // AIDEV-NOTE: the certificate is NOT looked up under [client_certs] in this
+        // mode: any certificate `http.client_ca` issued counts. A host that takes
+        // tokens passed on by a fleet server therefore relies on that CA issuing the
+        // fleet server's certificate and nothing else (the README says how: a
+        // certificate that signs itself, named as `client_ca`). Checked against real
+        // servers on 2026-11-22: a second certificate from the same CA was accepted
+        // with a passed-on token.
         AuthMode::MtlsAndToken if conn.client_cert.is_none() => {
             Err((StatusCode::FORBIDDEN, "no client certificate"))
         }
@@ -610,11 +617,21 @@ fn authenticate(shared: &Shared, conn: &Conn, headers: &HeaderMap) -> Result<Ses
         )),
     };
     match outcome {
-        Ok(principal) => Ok(Session {
-            principal: Arc::new(principal),
-            transport: "https",
-            peer: Some(conn.peer.to_string()),
-        }),
+        Ok(principal) => {
+            let mut session = Session::new(principal, "https", Some(conn.peer.to_string()));
+            // AIDEV-NOTE: only a fleet server keeps the token a caller presented, and
+            // only so that a rule with `identity = "caller"` can pass it on to a host.
+            // It is kept if and only if it is what authenticated this request (the
+            // principal is then `token:NAME`): a token that merely came along with a
+            // certificate that did the authenticating is not the caller's identity here.
+            if shared.server.is_fleet()
+                && session.principal.name.starts_with("token:")
+                && let Some(Some(token)) = presented
+            {
+                session.bearer = Some(crate::token::Secret::new(token));
+            }
+            Ok(session)
+        }
         Err(refusal) => Err(refusal),
     }
 }
@@ -666,7 +683,9 @@ fn audit_failure(shared: &Shared, conn: &Conn, reason: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod testing {
+    //! A test certificate authority and an HTTPS server with the test tools of
+    //! `mcp::testing`, for tests of this transport and of clients of it.
     use super::*;
     use crate::audit::testing::MemorySink;
     use crate::mcp::testing::{CONFIG, Effects, registry};
@@ -676,23 +695,18 @@ mod tests {
         BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
         Issuer, KeyPair, KeyUsagePurpose,
     };
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-    use serde_json::{Value, json};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     // ---- a small certificate authority for the tests ----
 
-    struct Authority {
-        params: CertificateParams,
-        key: KeyPair,
-        cert: Certificate,
+    pub struct Authority {
+        pub params: CertificateParams,
+        pub key: KeyPair,
+        pub cert: Certificate,
     }
 
-    fn authority(name: &str) -> Authority {
+    pub fn authority(name: &str) -> Authority {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -706,7 +720,7 @@ mod tests {
     }
 
     /// Issues a certificate and writes NAME.pem and NAME.key into `dir`.
-    fn issue(
+    pub fn issue(
         dir: &Path,
         ca: &Authority,
         name: &str,
@@ -723,42 +737,44 @@ mod tests {
             .signed_by(&key, &Issuer::from_params(&ca.params, &ca.key))
             .unwrap();
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
+        let key_file = dir.join(format!("{name}.key"));
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        // a private key is its owner's alone
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         cert
     }
 
     // ---- the server under test ----
 
-    struct Web {
-        dir: tempfile::TempDir,
-        addr: SocketAddr,
-        audit: MemorySink,
-        effects: Arc<Effects>,
-        stop: Option<tokio::sync::oneshot::Sender<()>>,
-        done: tokio::task::JoinHandle<Result<(), String>>,
+    pub struct Web {
+        pub dir: tempfile::TempDir,
+        pub addr: SocketAddr,
+        pub audit: MemorySink,
+        pub effects: Arc<Effects>,
+        pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+        pub done: tokio::task::JoinHandle<Result<(), String>>,
     }
 
-    const CI_TOKEN: &str = "opsmcp_ci_token";
-    const OPS_TOKEN: &str = "opsmcp_ops_token";
-    const OLD_TOKEN: &str = "opsmcp_old_token";
+    pub const CI_TOKEN: &str = "opsmcp_ci_token";
+    pub const OPS_TOKEN: &str = "opsmcp_ops_token";
+    pub const OLD_TOKEN: &str = "opsmcp_old_token";
 
     /// Starts a server with the given `http.auth` mode and extra lines for `[http]`.
     ///
     /// Callers: tokens ci (reader), ops (writer) and old (expired); client certificates
     /// alice (listed by CN, writer), bob (listed by fingerprint, reader), carol (issued by
     /// the right CA but not listed) and mallory (issued by an unrelated CA).
-    async fn web(auth: &str, extra: &str) -> Web {
+    pub async fn web(auth: &str, extra: &str) -> Web {
+        web_named(auth, extra, &["localhost", "127.0.0.1"]).await
+    }
+
+    /// Like `web`, with a server certificate for these names only.
+    pub async fn web_named(auth: &str, extra: &str, names: &[&str]) -> Web {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let ca = authority("opsmcp test ca");
         std::fs::write(d.join("ca.pem"), ca.cert.pem()).unwrap();
-        issue(
-            d,
-            &ca,
-            "server",
-            &["localhost", "127.0.0.1"],
-            ExtendedKeyUsagePurpose::ServerAuth,
-        );
+        issue(d, &ca, "server", names, ExtendedKeyUsagePurpose::ServerAuth);
         issue(d, &ca, "alice", &[], ExtendedKeyUsagePurpose::ClientAuth);
         let bob = issue(d, &ca, "bob", &[], ExtendedKeyUsagePurpose::ClientAuth);
         issue(d, &ca, "carol", &[], ExtendedKeyUsagePurpose::ClientAuth);
@@ -825,6 +841,20 @@ auth = "{auth}"
             done,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::mcp::testing::{Effects, registry};
+    use crate::tools::testing::host;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     // ---- a minimal HTTPS client ----
 

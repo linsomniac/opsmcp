@@ -1,0 +1,54 @@
+# opsmcp fleet server over HTTPS. Install as /etc/systemd/system/opsmcp-fleet-http.service.
+#
+# (`opsmcp fleet`, on stdio, needs no service: it is started by the caller, locally or
+# with `ssh bastion opsmcp fleet`.)
+
+[Unit]
+Description=opsmcp fleet server (HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/bin/opsmcp check-config --config /etc/opsmcp/fleet.toml
+ExecStart=/usr/bin/opsmcp fleet-http
+# `systemctl reload` has the inventory read again at once. (It is also read again by
+# itself: see fleet.inventory_refresh_secs. The rest of the configuration is only read
+# when the service starts.)
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# A fleet server runs no tools on this machine, so it does not need root: only to read
+# its configuration, inventory, keys and tokens, and to start ssh. Create the account,
+# and make those files its own (or root's, readable by it):
+#
+#     useradd --system --home-dir /var/lib/opsmcp-fleet --create-home opsmcp-fleet
+#     chown -R opsmcp-fleet: /etc/opsmcp/fleet.toml /etc/opsmcp/fleet
+#
+# ssh keeps the hosts' keys in that account's ~/.ssh/known_hosts (or wherever
+# fleet.ssh.options points UserKnownHostsFile).
+User=opsmcp-fleet
+Group=opsmcp-fleet
+
+LimitNOFILE=4096
+TasksMax=512
+
+# It only talks to the network and reads its own files.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+ReadWritePaths=/var/lib/opsmcp-fleet
+# For audit.file, if set:
+# ReadWritePaths=/var/log/opsmcp
+
+[Install]
+WantedBy=multi-user.target

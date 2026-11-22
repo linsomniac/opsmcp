@@ -452,7 +452,10 @@ fn journal_params() -> Vec<Param> {
             -1000,
             0,
         ),
-        Param::bool("kernel", "Only kernel messages"),
+        Param::bool(
+            "kernel",
+            "Only kernel messages, from every boot in the period (give boot to keep to one)",
+        ),
         Param::choice(
             "output",
             "Entry format (default short-iso)",
@@ -509,7 +512,11 @@ pub fn journal_args(args: &Args) -> Result<(Vec<String>, Option<String>), ToolEr
         argv.push(format!("--boot={boot}"));
     }
     if args.bool("kernel") == Some(true) {
-        argv.push("--dmesg".to_string());
+        // AIDEV-NOTE: the match, not `--dmesg`: that option also means `--boot`, which
+        // would silently limit the query to the current boot. Kernel messages from
+        // before a crash are what such a query is usually for. A positional match, so
+        // it stays last.
+        argv.push("_TRANSPORT=kernel".to_string());
     }
     Ok((argv, unit))
 }
@@ -1112,10 +1119,26 @@ dirs = ["{root}"]
                 "--case-sensitive=false",
                 "--identifier=nginx",
                 "--boot=-1",
-                "--dmesg",
+                "_TRANSPORT=kernel",
             ]
         );
         assert_eq!(unit, Some("nginx.service".to_string()));
+    }
+
+    /// AIDEV-NOTE: `journalctl --dmesg` is `--boot` plus a match on kernel messages: it
+    /// silently limits a query to the CURRENT boot. After a crash and reboot, "kernel
+    /// messages since yesterday" then shows nothing from before the reboot, which is
+    /// exactly what was being looked for. The match alone has no such limit.
+    #[test]
+    fn kernel_messages_are_selected_without_limiting_the_query_to_this_boot() {
+        let (argv, _) = journal(json!({"kernel": true, "since": "-3d"})).unwrap();
+        assert!(argv.iter().any(|a| a == "_TRANSPORT=kernel"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--dmesg" || a == "-k"),
+            "{argv:?}"
+        );
+        // the match is a positional argument, so it comes after every option
+        assert_eq!(argv.last().map(String::as_str), Some("_TRANSPORT=kernel"));
     }
 
     #[test]

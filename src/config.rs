@@ -42,8 +42,17 @@ pub struct Config {
     pub nrpe: NrpeCfg,
     pub net: NetCfg,
     pub users: UsersCfg,
+    pub monitoring: MonitoringCfg,
+    pub haproxy: HaproxyCfg,
+    pub storage: StorageCfg,
+    pub firewall: FirewallCfg,
+    pub trace: TraceCfg,
+    pub db: DbCfg,
+    pub package: PackageCfg,
     /// Operator-defined tools, by tool name.
     pub custom: BTreeMap<String, CustomCfg>,
+    /// Present in the configuration of a fleet server (`opsmcp fleet`), and only there.
+    pub fleet: Option<FleetCfg>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -240,8 +249,14 @@ pub struct FsCfg {
     pub read_roots: Vec<PathBuf>,
     /// Extra path globs that are never listed or read.
     pub deny: Vec<String>,
-    /// Keep the built-in list of never-readable paths (shadow files, private keys...).
+    /// Keep the built-in list of never-readable paths (shadow files, private keys...),
+    /// and the built-in list of paths config_edit never writes.
     pub default_deny: bool,
+    /// Directories whose files config_edit may replace. Empty by default: nothing may be
+    /// written.
+    pub write_roots: Vec<PathBuf>,
+    /// Where config_edit keeps the previous content of every file it changes.
+    pub backup_dir: PathBuf,
 }
 
 impl Default for FsCfg {
@@ -251,6 +266,8 @@ impl Default for FsCfg {
             read_roots: Vec::new(),
             deny: Vec::new(),
             default_deny: true,
+            write_roots: Vec::new(),
+            backup_dir: PathBuf::from("/var/backups/opsmcp"),
         }
     }
 }
@@ -339,6 +356,144 @@ impl Default for UsersCfg {
     }
 }
 
+/// Where monitoring_downtime reaches the monitoring system. The tool is off until
+/// `icinga_url` is set, and it only ever acts on this one host's own entry.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MonitoringCfg {
+    /// The Icinga 2 API, as `https://HOST[:PORT]` (port 5665 when left out).
+    pub icinga_url: Option<String>,
+    /// The Icinga ApiUser to log in as.
+    pub icinga_user: Option<String>,
+    /// A file holding that user's password and nothing else. It must not be readable by
+    /// group or others.
+    pub icinga_password_file: Option<PathBuf>,
+    /// The CA that signed the API's certificate. Unset: this host's CA bundle.
+    pub icinga_ca: Option<PathBuf>,
+    /// The name of this machine's host object in Icinga. Unset: the kernel's host name.
+    pub host: Option<String>,
+    /// The longest downtime that can be set, in minutes.
+    pub max_minutes: u32,
+}
+
+impl Default for MonitoringCfg {
+    fn default() -> Self {
+        MonitoringCfg {
+            icinga_url: None,
+            icinga_user: None,
+            icinga_password_file: None,
+            icinga_ca: None,
+            host: None,
+            max_minutes: 240,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HaproxyCfg {
+    /// HAProxy's admin socket (`stats socket ... level admin`).
+    pub socket: PathBuf,
+}
+
+impl Default for HaproxyCfg {
+    fn default() -> Self {
+        HaproxyCfg {
+            socket: PathBuf::from("/run/haproxy/admin.sock"),
+        }
+    }
+}
+
+/// The actions space_reclaim knows. `storage.reclaim` lists the ones this host allows.
+pub const RECLAIM_ACTIONS: [&str; 5] = [
+    "journal",
+    "package_cache",
+    "container_images",
+    "core_dumps",
+    "tmpfiles",
+];
+
+/// Limits on the tools that free or add disk space, whatever a role grants.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StorageCfg {
+    /// The space_reclaim actions allowed on this host, by name (see RECLAIM_ACTIONS).
+    /// Empty by default: none.
+    pub reclaim: Vec<String>,
+    /// Globs over the logical volumes lvm_extend may grow, as `VG/LV`. Empty by default:
+    /// none.
+    pub extendable: Vec<String>,
+    /// The most one lvm_extend call may add, in GiB.
+    pub max_extend_gb: u32,
+}
+
+impl Default for StorageCfg {
+    fn default() -> Self {
+        StorageCfg {
+            reclaim: Vec::new(),
+            extendable: Vec::new(),
+            max_extend_gb: 50,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FirewallCfg {
+    /// Globs over the address sets firewall_set_member may change, written as
+    /// `nft/FAMILY/TABLE/SET` or `ipset/NAME`. Empty by default: none.
+    pub sets: Vec<String>,
+}
+
+/// Limits on the tools that attach to running processes (process_trace, cpu_profile).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TraceCfg {
+    /// Globs over the processes that may be traced or profiled, as `OWNER/NAME` (the
+    /// form process grants use). Empty by default: none.
+    pub processes: Vec<String>,
+    /// Let cpu_profile sample the whole host rather than one process.
+    pub system_wide: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PackageCfg {
+    /// Let cve_status, when asked to, consult the distribution's security service
+    /// (`pro` on Ubuntu, fresh repository metadata on rpm hosts). That makes this host
+    /// contact the vendor and sends the CVE id out. Off by default.
+    pub cve_online: bool,
+}
+
+/// How db_status reaches the database servers on this host.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DbCfg {
+    /// A client options file with the credentials for MariaDB or MySQL, passed as
+    /// `--defaults-extra-file`. Unset: socket authentication as the server's own user.
+    pub mysql_defaults_file: Option<PathBuf>,
+    /// The Unix user that psql runs as (peer authentication). Used when opsmcp is root.
+    pub postgres_user: String,
+    /// The directory of PostgreSQL's Unix socket. Unset: psql's own default.
+    pub postgres_socket_dir: Option<PathBuf>,
+    /// Patroni's configuration file, for patronictl. Unset: the usual locations.
+    pub patroni_config: Option<PathBuf>,
+    /// Show the text of running queries. Off by default: queries can hold personal data.
+    pub show_queries: bool,
+}
+
+impl Default for DbCfg {
+    fn default() -> Self {
+        DbCfg {
+            mysql_defaults_file: None,
+            postgres_user: "postgres".to_string(),
+            postgres_socket_dir: None,
+            patroni_config: None,
+            show_queries: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomCfg {
@@ -394,6 +549,193 @@ pub struct CustomParamCfg {
     pub max_len: Option<usize>,
     pub min: Option<i64>,
     pub max: Option<i64>,
+}
+
+/// How a fleet server reaches a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    Ssh,
+    Https,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Ssh => "ssh",
+            Via::Https => "https",
+        }
+    }
+}
+
+/// Whose credential a fleet server presents to a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityMode {
+    /// The caller's own: their SSH keys and agent, or the bearer token they presented.
+    /// The host sees the person and applies its own roles for them.
+    Caller,
+    /// One this configuration names: an SSH key or a token file. The host sees a
+    /// service identity, and what the caller may do is decided here.
+    Fleet,
+}
+
+impl IdentityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityMode::Caller => "caller",
+            IdentityMode::Fleet => "fleet",
+        }
+    }
+}
+
+/// How a fleet server's inventory is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InventoryFormat {
+    /// opsmcp's own: `[hosts.NAME]` and `[groups]`, as TOML or JSON.
+    Opsmcp,
+    /// What `ansible-inventory --list` prints.
+    Ansible,
+}
+
+/// One `[[fleet.access]]` rule: for callers holding one of `roles`, how the hosts in
+/// `hosts` are reached. The first rule that fits decides.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessCfg {
+    /// A name for the audit trail and for messages. Unset: its position in the file.
+    pub name: Option<String>,
+    pub roles: Vec<String>,
+    /// Host names, patterns over them, and `group:NAME`.
+    pub hosts: Vec<String>,
+    pub via: Via,
+    pub identity: IdentityMode,
+    /// Only tools that change nothing may be used through this rule.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The account to log in to on the hosts. Needed with `identity = "fleet"`; with
+    /// `identity = "caller"` it is whatever the caller's own ssh settings say unless set.
+    pub ssh_user: Option<String>,
+    /// The private key to log in with (`via = "ssh"`, `identity = "fleet"`).
+    pub ssh_key: Option<PathBuf>,
+    /// A file holding the bearer token to present (`via = "https"`, `identity = "fleet"`).
+    pub token_file: Option<PathBuf>,
+}
+
+impl AccessCfg {
+    /// The rule's name, or `access[N]` (counting from 1) when it has none.
+    pub fn label(&self, index: usize) -> String {
+        match &self.name {
+            Some(name) => name.clone(),
+            None => format!("access[{}]", index + 1),
+        }
+    }
+}
+
+/// How the fleet server runs `ssh`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FleetSshCfg {
+    /// What is run on a host. Words only: it passes through the host's shell.
+    pub remote_command: Vec<String>,
+    /// Extra `ssh -o` options, as `Key=Value`.
+    pub options: Vec<String>,
+    /// The port, for hosts whose inventory entry does not set one. Unset: ssh's own.
+    pub port: Option<u16>,
+}
+
+impl Default for FleetSshCfg {
+    fn default() -> Self {
+        FleetSshCfg {
+            remote_command: ["sudo", "-n", "/usr/bin/opsmcp", "serve"]
+                .map(String::from)
+                .to_vec(),
+            options: Vec::new(),
+            port: None,
+        }
+    }
+}
+
+/// How the fleet server reaches hosts that run `opsmcp serve-http`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FleetHttpsCfg {
+    /// The port, for hosts whose inventory entry does not set one.
+    pub port: u16,
+    /// The CA that the hosts' certificates must chain to. Unset: this machine's bundle.
+    pub ca: Option<PathBuf>,
+    /// A client certificate to present to the hosts, with its key. With
+    /// `auth = "mtls+token"` on the hosts, a token is then only usable through here.
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+}
+
+impl Default for FleetHttpsCfg {
+    fn default() -> Self {
+        FleetHttpsCfg {
+            port: 8443,
+            ca: None,
+            client_cert: None,
+            client_key: None,
+        }
+    }
+}
+
+/// The `[fleet]` section: which hosts there are and how callers reach them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FleetCfg {
+    /// What this server calls itself to the hosts (it appears in their audit trails).
+    /// Unset: this machine's host name.
+    pub name: Option<String>,
+    /// The hosts and their groups: a `.toml` or `.json` file.
+    pub inventory: Option<PathBuf>,
+    /// Or a command that prints them as JSON: an argument list, the program first, as
+    /// an absolute path.
+    pub inventory_command: Option<Vec<String>>,
+    /// How the inventory is written.
+    pub inventory_format: InventoryFormat,
+    /// How often the inventory is looked at again, in seconds: a file is read again
+    /// when it has changed, a command is run again. 0: never. Unset: 30 for a file,
+    /// 300 for a command.
+    pub inventory_refresh_secs: Option<u64>,
+    /// The most hosts one call may name.
+    pub max_hosts_per_call: usize,
+    /// The most hosts asked at the same time within one call.
+    pub max_parallel: usize,
+    /// The most SSH sessions to hosts kept open.
+    pub max_connections: usize,
+    /// How long an SSH session to a host is kept after its last use.
+    pub idle_secs: u64,
+    /// How long a host gets to accept a connection.
+    pub connect_timeout_secs: u64,
+    /// How long a host that could not be reached is left alone before it is tried again.
+    pub retry_secs: u64,
+    pub ssh: FleetSshCfg,
+    pub https: FleetHttpsCfg,
+    pub access: Vec<AccessCfg>,
+}
+
+impl Default for FleetCfg {
+    fn default() -> Self {
+        FleetCfg {
+            name: None,
+            inventory: None,
+            inventory_command: None,
+            inventory_format: InventoryFormat::Opsmcp,
+            inventory_refresh_secs: None,
+            max_hosts_per_call: 50,
+            max_parallel: 16,
+            max_connections: 64,
+            idle_secs: 300,
+            connect_timeout_secs: 10,
+            retry_secs: 60,
+            ssh: FleetSshCfg::default(),
+            https: FleetHttpsCfg::default(),
+            access: Vec::new(),
+        }
+    }
 }
 
 /// What `Config::validate_grants` found.
@@ -663,10 +1005,396 @@ impl Config {
             }
         }
 
+        for dir in &self.fs.write_roots {
+            check_absolute("fs.write_roots", dir, &mut errs);
+        }
+        check_absolute("fs.backup_dir", &self.fs.backup_dir, &mut errs);
+
+        let monitoring = &self.monitoring;
+        if let Some(url) = &monitoring.icinga_url {
+            if let Err(problem) = parse_https_origin(url, 5665) {
+                errs.push(format!("monitoring.icinga_url: {problem}"));
+            }
+            if monitoring.icinga_user.is_none() || monitoring.icinga_password_file.is_none() {
+                errs.push(
+                    "monitoring: icinga_url needs icinga_user and icinga_password_file as well"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(user) = &monitoring.icinga_user
+            && (user.is_empty()
+                || user.len() > 128
+                || user.contains(':')
+                || user.chars().any(char::is_control))
+        {
+            errs.push(
+                "monitoring.icinga_user: must be 1 to 128 characters, without ':' or control characters"
+                    .to_string(),
+            );
+        }
+        if let Some(file) = &monitoring.icinga_password_file {
+            check_absolute("monitoring.icinga_password_file", file, &mut errs);
+        }
+        if let Some(file) = &monitoring.icinga_ca {
+            check_absolute("monitoring.icinga_ca", file, &mut errs);
+        }
+        if let Some(host) = &monitoring.host
+            && !is_host_name(host)
+        {
+            errs.push(format!("monitoring.host: {host:?} is not a host name"));
+        }
+        check_range(
+            "monitoring.max_minutes",
+            u64::from(monitoring.max_minutes),
+            1,
+            10_080,
+            &mut errs,
+        );
+        check_absolute("haproxy.socket", &self.haproxy.socket, &mut errs);
+        for action in &self.storage.reclaim {
+            if !RECLAIM_ACTIONS.contains(&action.as_str()) {
+                errs.push(format!(
+                    "storage.reclaim: {action:?} is not an action (the actions are {})",
+                    RECLAIM_ACTIONS.join(", ")
+                ));
+            }
+        }
+        if self.storage.extendable.iter().any(String::is_empty) {
+            errs.push("storage.extendable: contains an empty pattern".to_string());
+        }
+        check_range(
+            "storage.max_extend_gb",
+            u64::from(self.storage.max_extend_gb),
+            1,
+            10_240,
+            &mut errs,
+        );
+        if self.firewall.sets.iter().any(String::is_empty) {
+            errs.push("firewall.sets: contains an empty pattern".to_string());
+        }
+        if self.trace.processes.iter().any(String::is_empty) {
+            errs.push("trace.processes: contains an empty pattern".to_string());
+        }
+        if let Some(file) = &self.db.mysql_defaults_file {
+            check_absolute("db.mysql_defaults_file", file, &mut errs);
+        }
+        if let Some(dir) = &self.db.postgres_socket_dir {
+            check_absolute("db.postgres_socket_dir", dir, &mut errs);
+        }
+        if let Some(file) = &self.db.patroni_config {
+            check_absolute("db.patroni_config", file, &mut errs);
+        }
+        if !is_account_name(&self.db.postgres_user) {
+            errs.push(format!(
+                "db.postgres_user: {:?} is not a user name",
+                self.db.postgres_user
+            ));
+        }
+
         for (name, custom) in &self.custom {
             validate_custom(name, custom, limits.call_timeout_secs, &mut errs);
         }
+        if let Some(fleet) = &self.fleet {
+            self.validate_fleet(fleet, &mut errs);
+        }
         errs
+    }
+
+    /// Checks the `[fleet]` section.
+    fn validate_fleet(&self, fleet: &FleetCfg, errs: &mut Vec<String>) {
+        // AIDEV-NOTE: a fleet server sees a tool's name and arguments, never the unit,
+        // path or container the host resolves them to. A grant limited to a resource
+        // could not be honoured here, and ignoring the limit would grant more than was
+        // written, so such a grant is an error: the limit belongs in the host's own
+        // configuration, for the identity the fleet server reaches it as.
+        for (name, role) in &self.roles {
+            for (list, grants) in [("allow", &role.allow), ("deny", &role.deny)] {
+                for source in grants {
+                    if Grant::parse(source).is_ok_and(|grant| grant.resource().is_some()) {
+                        errs.push(format!(
+                            "roles.{name}.{list}: grant {source:?} is limited to a resource, \
+                             which a fleet server cannot check; grant the permission as a \
+                             whole here and limit it in the configuration of the hosts"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !self.custom.is_empty() {
+            errs.push(
+                "custom: a fleet server runs no tools itself; define custom tools in the \
+                 configuration of the hosts (they are reached with fleet_call)"
+                    .to_string(),
+            );
+        }
+        if let Some(name) = &fleet.name
+            && !is_plain_name(name)
+        {
+            errs.push(
+                "fleet.name: may only contain letters, digits, '.', '_' and '-' (at most 64)"
+                    .to_string(),
+            );
+        }
+        match (&fleet.inventory, &fleet.inventory_command) {
+            (None, None) => errs.push(
+                "fleet.inventory: name the file that lists the hosts (or set \
+                 fleet.inventory_command)"
+                    .to_string(),
+            ),
+            (Some(_), Some(_)) => {
+                errs.push("fleet: set either inventory or inventory_command, not both".to_string())
+            }
+            (Some(path), None) => {
+                check_absolute("fleet.inventory", path, errs);
+                let extension = path.extension().and_then(|e| e.to_str());
+                let ansible = fleet.inventory_format == InventoryFormat::Ansible;
+                if !path.is_absolute() {
+                    // said above
+                } else if ansible && extension != Some("json") {
+                    errs.push(format!(
+                        "fleet.inventory: {:?} must end in .json: with inventory_format = \
+                         \"ansible\" it holds what `ansible-inventory --list` prints, not \
+                         one of Ansible's own inventory files",
+                        path.display().to_string()
+                    ));
+                } else if !matches!(extension, Some("toml" | "json")) {
+                    errs.push(format!(
+                        "fleet.inventory: {:?} must end in .toml or .json, which says how it \
+                         is written",
+                        path.display().to_string()
+                    ));
+                }
+            }
+            (None, Some(command)) => {
+                let program_ok = command.first().is_some_and(|p| Path::new(p).is_absolute());
+                let words_ok = command
+                    .iter()
+                    .all(|word| !word.is_empty() && !word.chars().any(char::is_control));
+                if !program_ok || !words_ok {
+                    errs.push(
+                        "fleet.inventory_command: must be an argument list whose first \
+                         element is the absolute path of a program, with no empty elements"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        for (setting, value, min, max) in [
+            (
+                "max_hosts_per_call",
+                fleet.max_hosts_per_call as u64,
+                1,
+                1000,
+            ),
+            ("max_parallel", fleet.max_parallel as u64, 1, 256),
+            ("max_connections", fleet.max_connections as u64, 1, 4096),
+            ("idle_secs", fleet.idle_secs, 10, 86_400),
+            ("connect_timeout_secs", fleet.connect_timeout_secs, 1, 120),
+            ("retry_secs", fleet.retry_secs, 0, 3600),
+            (
+                "inventory_refresh_secs",
+                fleet.inventory_refresh_secs.unwrap_or(0),
+                0,
+                86_400,
+            ),
+        ] {
+            check_range(&format!("fleet.{setting}"), value, min, max, errs);
+        }
+        // One call may ask `max_parallel` hosts at once, each over a session of its own.
+        if fleet.max_connections >= 1 && fleet.max_connections < fleet.max_parallel {
+            errs.push(
+                "fleet.max_connections: must be at least fleet.max_parallel, the number of \
+                 hosts one call asks at the same time"
+                    .to_string(),
+            );
+        }
+
+        // AIDEV-NOTE: ssh joins the remote command's words with spaces and the host's
+        // shell reads the result, so each word may only contain characters no shell
+        // treats specially. This is configuration, not caller input, but a word with a
+        // space or a `;` in it would not mean what its author wrote.
+        let command = &fleet.ssh.remote_command;
+        let is_word = |word: &String| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_./=:@%+,-".contains(c))
+        };
+        if command.is_empty()
+            || !command.iter().all(is_word)
+            || command.first().is_some_and(|first| first.starts_with('-'))
+        {
+            errs.push(
+                "fleet.ssh.remote_command: must be a list of plain words (letters, digits \
+                 and _ . / = : @ % + , -), the program first"
+                    .to_string(),
+            );
+        }
+        for option in &fleet.ssh.options {
+            if let Err(problem) = check_ssh_option(option) {
+                errs.push(format!("fleet.ssh.options: {option:?} {problem}"));
+            }
+        }
+        if fleet.ssh.port == Some(0) {
+            errs.push("fleet.ssh.port: must be between 1 and 65535".to_string());
+        }
+
+        let https = &fleet.https;
+        if https.port == 0 {
+            errs.push("fleet.https.port: must be between 1 and 65535".to_string());
+        }
+        if let Some(ca) = &https.ca {
+            check_absolute("fleet.https.ca", ca, errs);
+        }
+        match (&https.client_cert, &https.client_key) {
+            (Some(cert), Some(key)) => {
+                check_absolute("fleet.https.client_cert", cert, errs);
+                check_absolute("fleet.https.client_key", key, errs);
+            }
+            (Some(_), None) => {
+                errs.push("fleet.https.client_key: needed with fleet.https.client_cert".to_string())
+            }
+            (None, Some(_)) => {
+                errs.push("fleet.https.client_cert: needed with fleet.https.client_key".to_string())
+            }
+            (None, None) => {
+                // AIDEV-NOTE: over HTTPS a bearer token (a caller's own, or the
+                // fleet's) is sent to every host a rule covers, and a token is good
+                // wherever it alone is enough: a host that was sent one could use it
+                // on the other hosts. The fleet's certificate is what lets hosts
+                // refuse a token that did not come through this server. Whether they
+                // ask for it cannot be seen from here; that there is one to show is
+                // insisted on, so that the only step left is on the hosts.
+                let over_https: Vec<String> = fleet
+                    .access
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rule)| rule.via == Via::Https)
+                    .map(|(index, rule)| rule.label(index))
+                    .collect();
+                if !over_https.is_empty() {
+                    errs.push(format!(
+                        "fleet.https.client_cert: needed (with client_key) because hosts are \
+                         reached over HTTPS (rule {}): a bearer token is sent to every host \
+                         such a rule covers, and only a certificate of this server's lets \
+                         the hosts refuse a token that came from anywhere else. Require it \
+                         on the hosts with `auth = \"mtls+token\"`",
+                        over_https.join(", ")
+                    ));
+                }
+            }
+        }
+
+        if fleet.access.is_empty() {
+            errs.push(
+                "fleet.access: there are no [[fleet.access]] rules, so no caller could reach \
+                 any host"
+                    .to_string(),
+            );
+        }
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for (index, rule) in fleet.access.iter().enumerate() {
+            let at = format!("fleet.access[{}]", index + 1);
+            if let Some(name) = &rule.name {
+                if !is_plain_name(name) {
+                    errs.push(format!(
+                        "{at}.name: may only contain letters, digits, '.', '_' and '-' (at \
+                         most 64)"
+                    ));
+                } else if !names.insert(name) {
+                    errs.push(format!(
+                        "{at}.name: {name:?} is also the name of an earlier rule"
+                    ));
+                }
+            }
+            self.check_roles(&at, &rule.roles, errs);
+            if let Err(problem) = crate::fleet::inventory::Selector::parse_list(&rule.hosts) {
+                errs.push(format!("{at}.hosts: {problem}"));
+            }
+            if let Some(user) = &rule.ssh_user
+                && !is_account_name(user)
+            {
+                errs.push(format!("{at}.ssh_user: {user:?} is not an account name"));
+            }
+            if let Some(key) = &rule.ssh_key {
+                check_absolute(&format!("{at}.ssh_key"), key, errs);
+            }
+            if let Some(file) = &rule.token_file {
+                check_absolute(&format!("{at}.token_file"), file, errs);
+            }
+            let has = |what: bool, setting: &str, errs: &mut Vec<String>, why: &str| {
+                if what {
+                    errs.push(format!("{at}.{setting}: {why}"));
+                }
+            };
+            match (rule.via, rule.identity) {
+                (Via::Ssh, IdentityMode::Caller) => {
+                    has(
+                        rule.ssh_key.is_some(),
+                        "ssh_key",
+                        errs,
+                        "not used with identity = \"caller\", which logs in with the \
+                         caller's own keys; for a key of the fleet's own, set identity = \
+                         \"fleet\"",
+                    );
+                }
+                (Via::Ssh, IdentityMode::Fleet) => {
+                    has(
+                        rule.ssh_user.is_none(),
+                        "ssh_user",
+                        errs,
+                        "needed with identity = \"fleet\": the account to log in to",
+                    );
+                    has(
+                        rule.ssh_key.is_none(),
+                        "ssh_key",
+                        errs,
+                        "needed with identity = \"fleet\": the private key to log in with",
+                    );
+                }
+                (Via::Https, IdentityMode::Caller) => {
+                    has(
+                        rule.token_file.is_some(),
+                        "token_file",
+                        errs,
+                        "not used with identity = \"caller\", which passes on the caller's \
+                         own token; for a token of the fleet's own, set identity = \"fleet\"",
+                    );
+                }
+                (Via::Https, IdentityMode::Fleet) => {
+                    has(
+                        rule.token_file.is_none(),
+                        "token_file",
+                        errs,
+                        "needed with identity = \"fleet\": a file holding the token to present",
+                    );
+                }
+            }
+            match rule.via {
+                Via::Ssh => has(
+                    rule.token_file.is_some(),
+                    "token_file",
+                    errs,
+                    "not used with via = \"ssh\"",
+                ),
+                Via::Https => {
+                    has(
+                        rule.ssh_user.is_some(),
+                        "ssh_user",
+                        errs,
+                        "not used with via = \"https\"",
+                    );
+                    has(
+                        rule.ssh_key.is_some(),
+                        "ssh_key",
+                        errs,
+                        "not used with via = \"https\"",
+                    );
+                }
+            }
+        }
     }
 
     fn check_roles(&self, at: &str, roles: &[String], errs: &mut Vec<String>) {
@@ -720,20 +1448,37 @@ impl Config {
     pub fn validate_grants(&self, known: &[(String, Access)]) -> GrantProblems {
         let mut problems = GrantProblems::default();
         for (name, role) in &self.roles {
-            for (list, grants, into) in [
-                ("allow", &role.allow, &mut problems.warnings),
-                ("deny", &role.deny, &mut problems.errors),
-            ] {
+            for (list, grants) in [("allow", &role.allow), ("deny", &role.deny)] {
                 for source in grants {
                     // A grant that does not parse is reported by `validate`.
                     let Ok(grant) = Grant::parse(source) else {
                         continue;
                     };
+                    // AIDEV-NOTE: a fleet server cannot know which custom tools the
+                    // hosts define. An `allow` for one is taken on trust: at worst it
+                    // grants a tool that does not exist. A `deny` cannot be taken on
+                    // trust in silence, because a misspelled one denies nothing; since
+                    // it cannot be checked here either, it is pointed out.
+                    if self.fleet.is_some() && grant.is_for_custom_tools() {
+                        if list == "deny" {
+                            problems.warnings.push(format!(
+                                "roles.{name}.deny: grant {source:?} names a tool that only \
+                                 hosts define, so it cannot be checked here: make sure it is \
+                                 spelled as on the hosts, or it denies nothing"
+                            ));
+                        }
+                        continue;
+                    }
                     if !known.iter().any(|(p, a)| grant.covers_permission(p, *a)) {
-                        into.push(format!(
+                        let message = format!(
                             "roles.{name}.{list}: grant {source:?} matches no permission \
                              (`opsmcp tools` lists them)"
-                        ));
+                        );
+                        if list == "deny" {
+                            problems.errors.push(message);
+                        } else {
+                            problems.warnings.push(message);
+                        }
                     }
                 }
             }
@@ -837,6 +1582,121 @@ pub fn is_account_name(name: &str) -> bool {
         && body
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+}
+
+/// A DNS host name: labels of letters, digits and `-` separated by dots, at most 253
+/// characters. No trailing dot, no address literals.
+pub fn is_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// Splits `https://HOST[:PORT]` into host and port. Nothing else is accepted: no other
+/// scheme (credentials are sent to it), no user name, path or query. A trailing `/` is
+/// allowed. The host is a DNS name or an IPv4 address.
+pub fn parse_https_origin(url: &str, default_port: u16) -> Result<(String, u16), String> {
+    let wrong = || format!("{url:?} must have the form https://HOST[:PORT]");
+    let rest = url.strip_prefix("https://").ok_or_else(wrong)?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            let port: u16 = port.parse().map_err(|_| wrong())?;
+            if port == 0 {
+                return Err(wrong());
+            }
+            (host, port)
+        }
+        None => (rest, default_port),
+    };
+    if !is_host_name(host) {
+        return Err(wrong());
+    }
+    Ok((host.to_ascii_lowercase(), port))
+}
+
+/// A name for a fleet server or one of its rules: letters, digits, `.`, `_` and `-`.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// `ssh -o` options that cannot be given in `fleet.ssh.options`: the fleet server sets
+/// them itself, or they say who to log in as, which is for the rules to decide.
+///
+/// AIDEV-NOTE: the first group is what makes a session to a host non-interactive, unable
+/// to forward anything, and bound to the one command in `fleet.ssh.remote_command`. The
+/// second is the identity: with a key of the fleet's own, "that key and nothing else"
+/// would not hold if an option here could add an identity file, an agent or a shared
+/// connection. ssh takes the first value it is given and ours come first, but for an
+/// option that accumulates (IdentityFile) that is no protection, hence this list.
+pub const RESERVED_SSH_OPTIONS: &[&str] = &[
+    "batchmode",
+    "forwardagent",
+    "forwardx11",
+    "forwardx11trusted",
+    "clearallforwardings",
+    "permitlocalcommand",
+    "localcommand",
+    "remotecommand",
+    "requesttty",
+    "escapechar",
+    "sessiontype",
+    "stdinnull",
+    "forkafterauthentication",
+    "loglevel",
+    "connecttimeout",
+    "serveraliveinterval",
+    "serveralivecountmax",
+    "sendenv",
+    "setenv",
+    // who to log in as, and to what
+    "identityfile",
+    "identityagent",
+    "identitiesonly",
+    "certificatefile",
+    "preferredauthentications",
+    "controlmaster",
+    "controlpath",
+    "controlpersist",
+    "user",
+    "port",
+    "hostname",
+];
+
+/// Checks one `Key=Value` for `fleet.ssh.options`.
+fn check_ssh_option(option: &str) -> Result<(), String> {
+    let (key, value) = option
+        .split_once('=')
+        .ok_or_else(|| "must be written Key=Value".to_string())?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err("must be written Key=Value, the key being an ssh option name".to_string());
+    }
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("needs a value, on one line".to_string());
+    }
+    let key = key.to_ascii_lowercase();
+    if RESERVED_SSH_OPTIONS.contains(&key.as_str()) {
+        return Err(
+            "cannot be given here: opsmcp sets it itself, from the rule and the inventory"
+                .to_string(),
+        );
+    }
+    // Host keys must be checked: a host that is not who it says it is would be handed
+    // commands meant for another, and its answers believed.
+    if key == "stricthostkeychecking" && !matches!(value, "yes" | "accept-new") {
+        return Err("may only be yes (the default) or accept-new".to_string());
+    }
+    Ok(())
 }
 
 fn check_absolute(at: &str, path: &Path, errs: &mut Vec<String>) {
@@ -1025,6 +1885,429 @@ deny = ["fs.read:/etc/ssl/private/**"]
 allow = ["@all"]
 "#;
 
+    const FLEET: &str = r#"
+[roles.ops]
+allow = ["@all"]
+[roles.dev]
+allow = ["@read", "custom.galera_status"]
+[unix_groups.ops]
+roles = ["ops"]
+[fleet]
+inventory = "/etc/opsmcp/fleet/hosts.toml"
+"#;
+
+    /// A fleet configuration with one rule, written by the test.
+    fn fleet_with(rule: &str) -> String {
+        format!("{FLEET}\n[[fleet.access]]\n{rule}\n")
+    }
+
+    const OPS_RULE: &str =
+        "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"";
+
+    #[test]
+    fn a_fleet_configuration_has_defaults_for_everything_but_the_hosts_and_the_rules() {
+        let cfg = Config::parse(&fleet_with(OPS_RULE)).unwrap();
+        let fleet = cfg.fleet.as_ref().unwrap();
+        assert_eq!(
+            fleet.ssh.remote_command,
+            ["sudo", "-n", "/usr/bin/opsmcp", "serve"]
+        );
+        assert_eq!(fleet.https.port, 8443);
+        assert_eq!(fleet.max_hosts_per_call, 50);
+        let rule = &fleet.access[0];
+        assert_eq!((rule.via, rule.identity), (Via::Ssh, IdentityMode::Caller));
+        assert!(!rule.read_only);
+        assert_eq!(rule.label(0), "access[1]");
+        // a configuration without the section is not a fleet configuration
+        assert!(Config::parse(ROLES).unwrap().fleet.is_none());
+    }
+
+    #[test]
+    fn every_kind_of_rule_can_be_written() {
+        let text = format!(
+            "{FLEET}
+[[fleet.access]]
+name = \"ops-direct\"
+{OPS_RULE}
+ssh_user = \"ops\"
+
+[[fleet.access]]
+roles = [\"dev\"]
+hosts = [\"group:web\", \"db*\"]
+via = \"ssh\"
+identity = \"fleet\"
+ssh_user = \"fleet-dev\"
+ssh_key = \"/etc/opsmcp/fleet/dev_ed25519\"
+read_only = true
+
+[[fleet.access]]
+roles = [\"ops\"]
+hosts = [\"*\"]
+via = \"https\"
+identity = \"caller\"
+
+[[fleet.access]]
+roles = [\"dev\"]
+hosts = [\"group:staging\"]
+via = \"https\"
+identity = \"fleet\"
+token_file = \"/etc/opsmcp/fleet/dev.token\"
+
+[fleet.ssh]
+remote_command = [\"/usr/bin/opsmcp\", \"serve\"]
+options = [\"ProxyJump=jump.example.com\", \"StrictHostKeyChecking=accept-new\"]
+port = 2222
+
+[fleet.https]
+port = 9443
+ca = \"/etc/opsmcp/fleet/ca.crt\"
+client_cert = \"/etc/opsmcp/fleet/client.crt\"
+client_key = \"/etc/opsmcp/fleet/client.key\"
+"
+        );
+        let cfg = Config::parse(&text).unwrap_or_else(|e| panic!("{e:?}"));
+        let fleet = cfg.fleet.unwrap();
+        assert_eq!(fleet.access.len(), 4);
+        assert_eq!(fleet.access[0].label(0), "ops-direct");
+    }
+
+    #[test]
+    fn a_fleet_needs_an_inventory_and_at_least_one_rule() {
+        let no_rules = FLEET;
+        assert_one_error_mentions(no_rules, &["fleet.access"]);
+        let no_inventory =
+            fleet_with(OPS_RULE).replace("inventory = \"/etc/opsmcp/fleet/hosts.toml\"\n", "");
+        assert_one_error_mentions(&no_inventory, &["fleet.inventory"]);
+        let both = fleet_with(OPS_RULE).replace(
+            "[fleet]\n",
+            "[fleet]\ninventory_command = [\"/usr/local/bin/hosts\"]\n",
+        );
+        assert_one_error_mentions(&both, &["inventory", "inventory_command"]);
+        let relative =
+            fleet_with(OPS_RULE).replace("\"/etc/opsmcp/fleet/hosts.toml\"", "\"hosts.toml\"");
+        assert_one_error_mentions(&relative, &["fleet.inventory", "absolute"]);
+        let odd = fleet_with(OPS_RULE).replace("hosts.toml", "hosts.ini");
+        assert_one_error_mentions(&odd, &["fleet.inventory", ".toml"]);
+        for bad in ["[]", "[\"hosts\"]", "[\"/usr/bin/hosts\", \"\"]"] {
+            let text = fleet_with(OPS_RULE).replace(
+                "inventory = \"/etc/opsmcp/fleet/hosts.toml\"",
+                &format!("inventory_command = {bad}"),
+            );
+            assert_one_error_mentions(&text, &["fleet.inventory_command"]);
+        }
+    }
+
+    #[test]
+    fn an_ansible_inventory_is_named_as_one_and_a_file_of_it_is_json() {
+        const OWN: &str = "inventory = \"/etc/opsmcp/fleet/hosts.toml\"";
+        // opsmcp's own format unless said otherwise
+        let fleet = Config::parse(&fleet_with(OPS_RULE)).unwrap().fleet.unwrap();
+        assert_eq!(fleet.inventory_format, InventoryFormat::Opsmcp);
+
+        let saved = fleet_with(OPS_RULE).replace(
+            OWN,
+            "inventory = \"/etc/opsmcp/fleet/hosts.json\"\ninventory_format = \"ansible\"",
+        );
+        let fleet = Config::parse(&saved).unwrap().fleet.unwrap();
+        assert_eq!(fleet.inventory_format, InventoryFormat::Ansible);
+
+        let live = fleet_with(OPS_RULE).replace(
+            OWN,
+            "inventory_command = [\"/usr/local/bin/fleet-hosts\"]\ninventory_format = \"ansible\"",
+        );
+        let fleet = Config::parse(&live).unwrap().fleet.unwrap();
+        assert_eq!(fleet.inventory_format, InventoryFormat::Ansible);
+
+        // Ansible's own files (INI, YAML) are not read: what it prints from them is
+        let ini = fleet_with(OPS_RULE).replace(
+            OWN,
+            "inventory = \"/etc/ansible/hosts.toml\"\ninventory_format = \"ansible\"",
+        );
+        assert_one_error_mentions(
+            &ini,
+            &["fleet.inventory", ".json", "ansible-inventory --list"],
+        );
+        let unknown =
+            fleet_with(OPS_RULE).replace(OWN, &format!("{OWN}\ninventory_format = \"yaml\""));
+        assert!(Config::parse(&unknown).is_err());
+    }
+
+    #[test]
+    fn how_often_the_inventory_is_looked_at_again_can_be_set() {
+        const OWN: &str = "inventory = \"/etc/opsmcp/fleet/hosts.toml\"";
+        let fleet = Config::parse(&fleet_with(OPS_RULE)).unwrap().fleet.unwrap();
+        assert_eq!(fleet.inventory_refresh_secs, None);
+        for (written, read) in [("0", 0), ("1", 1), ("300", 300), ("86400", 86_400)] {
+            let text = fleet_with(OPS_RULE)
+                .replace(OWN, &format!("{OWN}\ninventory_refresh_secs = {written}"));
+            let fleet = Config::parse(&text).unwrap().fleet.unwrap();
+            assert_eq!(fleet.inventory_refresh_secs, Some(read));
+        }
+        let long =
+            fleet_with(OPS_RULE).replace(OWN, &format!("{OWN}\ninventory_refresh_secs = 86401"));
+        assert_one_error_mentions(&long, &["fleet.inventory_refresh_secs"]);
+    }
+
+    #[test]
+    fn a_rule_must_be_complete_and_consistent() {
+        let cases: &[(&str, &[&str])] = &[
+            // roles and hosts
+            (
+                "roles = []\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["roles is empty"],
+            ),
+            (
+                "roles = [\"nobody\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["unknown role", "nobody"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = []\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["hosts"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"-oProxyCommand=id\"]\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["hosts"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"a,b\"]\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["hosts"],
+            ),
+            // the caller's own identity takes no credential from here
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"\nssh_key = \"/k\"",
+                &["ssh_key", "caller"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"caller\"\ntoken_file = \"/t\"",
+                &["token_file", "caller"],
+            ),
+            // an identity of the fleet's own needs its credential
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"fleet\"\nssh_user = \"u\"",
+                &["ssh_key"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"fleet\"\nssh_key = \"/k\"",
+                &["ssh_user"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"fleet\"",
+                &["token_file"],
+            ),
+            // settings of the other transport are mistakes
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"fleet\"\ntoken_file = \"/t\"\nssh_user = \"u\"",
+                &["ssh_user", "https"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"fleet\"\nssh_user = \"u\"\nssh_key = \"/k\"\ntoken_file = \"/t\"",
+                &["token_file", "ssh"],
+            ),
+            // values
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"\nssh_user = \"-oProxyCommand=id\"",
+                &["ssh_user"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"fleet\"\nssh_user = \"u\"\nssh_key = \"key\"",
+                &["ssh_key", "absolute"],
+            ),
+            (
+                "roles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"fleet\"\ntoken_file = \"t\"",
+                &["token_file", "absolute"],
+            ),
+            (
+                "name = \"two words\"\nroles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"ssh\"\nidentity = \"caller\"",
+                &["name"],
+            ),
+        ];
+        for (rule, needles) in cases {
+            // with the certificate that rules over HTTPS need, so that it is not what
+            // is wrong with any of these
+            let text = format!(
+                "{}\n[fleet.https]\nclient_cert = \"/c.crt\"\nclient_key = \"/c.key\"\n",
+                fleet_with(rule)
+            );
+            assert_one_error_mentions(&text, needles);
+        }
+        // unknown words are errors
+        assert!(!errors(&fleet_with(&OPS_RULE.replace("\"ssh\"", "\"telnet\""))).is_empty());
+        assert!(!errors(&fleet_with(&OPS_RULE.replace("\"caller\"", "\"root\""))).is_empty());
+        assert!(!errors(&fleet_with(&format!("{OPS_RULE}\nreadonly = true"))).is_empty());
+    }
+
+    #[test]
+    fn a_rule_that_reaches_hosts_over_https_needs_the_fleets_certificate() {
+        // AIDEV-NOTE: over HTTPS a bearer token (the caller's own, or the fleet's) is
+        // sent to every host a rule covers, and a token is good wherever it alone is
+        // enough: a host that was sent one could use it on the others. A certificate
+        // of the fleet's is what lets the hosts refuse a token that did not come
+        // through this server (`auth = "mtls+token"` there). Whether they do cannot be
+        // seen from here; that this server has one to show can be insisted on.
+        const CERT: &str = "[fleet.https]\nclient_cert = \"/c.crt\"\nclient_key = \"/c.key\"\n";
+        for rule in [
+            "name = \"own-token\"\nroles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"caller\"",
+            "name = \"fleet-token\"\nroles = [\"ops\"]\nhosts = [\"*\"]\nvia = \"https\"\nidentity = \"fleet\"\ntoken_file = \"/t\"",
+        ] {
+            let name = if rule.contains("own-token") {
+                "own-token"
+            } else {
+                "fleet-token"
+            };
+            assert_one_error_mentions(
+                &fleet_with(rule),
+                &["fleet.https.client_cert", name, "mtls+token"],
+            );
+            let with_certificate = format!("{}\n{CERT}", fleet_with(rule));
+            assert_eq!(errors(&with_certificate), Vec::<String>::new());
+        }
+        // a fleet that only uses SSH needs none
+        assert_eq!(errors(&fleet_with(OPS_RULE)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn two_rules_cannot_have_the_same_name() {
+        let text = format!(
+            "{FLEET}\n[[fleet.access]]\nname = \"a\"\n{OPS_RULE}\n[[fleet.access]]\nname = \"a\"\n{OPS_RULE}\n"
+        );
+        assert_one_error_mentions(&text, &["name", "\"a\""]);
+    }
+
+    #[test]
+    fn the_remote_command_is_plain_words() {
+        for bad in [
+            "[]",
+            "[\"\"]",
+            "[\"sudo\", \"opsmcp serve\"]",
+            "[\"opsmcp\", \"serve;id\"]",
+            "[\"opsmcp\", \"$(id)\"]",
+            "[\"opsmcp\", \"serve\", \"|\", \"tee\"]",
+            "[\"-n\", \"opsmcp\"]",
+            "[\"opsmcp\", \"se`rve\"]",
+            "[\"opsmcp\", \"serve\\n\"]",
+        ] {
+            let text = format!(
+                "{}\n[fleet.ssh]\nremote_command = {bad}\n",
+                fleet_with(OPS_RULE)
+            );
+            assert_one_error_mentions(&text, &["fleet.ssh.remote_command"]);
+        }
+    }
+
+    #[test]
+    fn ssh_options_cannot_undo_what_the_fleet_relies_on() {
+        for bad in [
+            "BatchMode=no",
+            "batchmode=no",
+            "ForwardAgent=yes",
+            "StrictHostKeyChecking=no",
+            "StrictHostKeyChecking=off",
+            "RemoteCommand=id",
+            "RequestTTY=yes",
+            "IdentityFile=/root/.ssh/id_ed25519",
+            "identityagent=/tmp/agent.sock",
+            "ControlPath=/tmp/%r@%h",
+            "User=root",
+            "ConnectTimeout=1",
+            "no-equals-sign",
+            "=value",
+            "Proxy Jump=x",
+            "ProxyJump=",
+            "ProxyJump=a\\nb",
+        ] {
+            let text = format!(
+                "{}\n[fleet.ssh]\noptions = [\"{bad}\"]\n",
+                fleet_with(OPS_RULE)
+            );
+            assert_one_error_mentions(&text, &["fleet.ssh.options"]);
+        }
+        for good in [
+            "StrictHostKeyChecking=accept-new",
+            "ProxyJump=jump.example.com",
+            "UserKnownHostsFile=/etc/opsmcp/fleet/known_hosts",
+        ] {
+            let text = format!(
+                "{}\n[fleet.ssh]\noptions = [\"{good}\"]\n",
+                fleet_with(OPS_RULE)
+            );
+            assert!(errors(&text).is_empty(), "{good}: {:?}", errors(&text));
+        }
+    }
+
+    #[test]
+    fn fleet_numbers_and_paths_are_checked() {
+        for (line, needle) in [
+            ("max_hosts_per_call = 0", "fleet.max_hosts_per_call"),
+            ("max_parallel = 0", "fleet.max_parallel"),
+            ("max_connections = 0", "fleet.max_connections"),
+            ("idle_secs = 1", "fleet.idle_secs"),
+            ("connect_timeout_secs = 0", "fleet.connect_timeout_secs"),
+            ("retry_secs = 100000", "fleet.retry_secs"),
+            ("name = \"two words\"", "fleet.name"),
+        ] {
+            let text = fleet_with(OPS_RULE).replace("[fleet]\n", &format!("[fleet]\n{line}\n"));
+            assert_one_error_mentions(&text, &[needle]);
+        }
+        for (section, needle) in [
+            ("[fleet.ssh]\nport = 0", "fleet.ssh.port"),
+            ("[fleet.https]\nport = 0", "fleet.https.port"),
+            ("[fleet.https]\nca = \"ca.crt\"", "fleet.https.ca"),
+            ("[fleet.https]\nclient_cert = \"/c.crt\"", "client_key"),
+            ("[fleet.https]\nclient_key = \"/c.key\"", "client_cert"),
+        ] {
+            let text = format!("{}\n{section}\n", fleet_with(OPS_RULE));
+            assert_one_error_mentions(&text, &[needle]);
+        }
+    }
+
+    #[test]
+    fn a_fleet_keeps_at_least_as_many_sessions_as_it_asks_hosts_at_once() {
+        let text = fleet_with(OPS_RULE).replace(
+            "[fleet]\n",
+            "[fleet]\nmax_parallel = 32\nmax_connections = 16\n",
+        );
+        assert_one_error_mentions(&text, &["fleet.max_connections", "max_parallel"]);
+    }
+
+    #[test]
+    fn a_fleet_cannot_check_a_denial_of_a_hosts_own_tool_and_says_so() {
+        let text = fleet_with(OPS_RULE).replace(
+            "allow = [\"@read\", \"custom.galera_status\"]",
+            "allow = [\"@read\", \"custom.galera_status\"]\ndeny = [\"custom.rebot\"]",
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let problems = cfg.validate_grants(&[("system.view".to_string(), Access::Read)]);
+        assert!(problems.errors.is_empty(), "{:?}", problems.errors);
+        // Granting a tool that no host has does no harm, and is taken on trust. A denial
+        // that names no tool (a misspelling) would silently deny nothing, and a fleet
+        // server cannot tell: it says so rather than stay quiet.
+        assert_eq!(problems.warnings.len(), 1, "{:?}", problems.warnings);
+        assert!(
+            problems.warnings[0].contains("custom.rebot") && problems.warnings[0].contains("hosts"),
+            "{:?}",
+            problems.warnings
+        );
+    }
+
+    #[test]
+    fn a_fleet_role_cannot_limit_a_grant_to_a_resource() {
+        // the fleet server never sees the unit, path or container a host resolves the
+        // call to, so it could not honour such a limit: refusing beats ignoring it
+        let text = fleet_with(OPS_RULE).replace(
+            "allow = [\"@all\"]",
+            "allow = [\"@read\", \"service.control:nginx.service\"]",
+        );
+        assert_one_error_mentions(
+            &text,
+            &["roles.ops.allow", "service.control:nginx.service", "host"],
+        );
+        let text = fleet_with(OPS_RULE).replace(
+            "allow = [\"@all\"]",
+            "allow = [\"@all\"]\ndeny = [\"fs.read:/etc/ssl/**\"]",
+        );
+        assert_one_error_mentions(&text, &["roles.ops.deny", "fs.read:/etc/ssl/**"]);
+    }
+
     #[test]
     fn an_empty_configuration_is_valid_and_grants_nothing() {
         let cfg = Config::parse("").unwrap();
@@ -1186,6 +2469,139 @@ tls_key = "/etc/opsmcp/tls/server.key"
                   capture_payload = true\n[users]\nmin_uid = 500\nprotected = [\"root\", \"deploy*\"]\n\
                   groups = [\"www-data\", \"dev.team\"]\nmanage_ssh_keys = true\n";
         assert_eq!(errors(ok), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_tools_that_change_or_attach_allow_nothing_until_configured() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.fs.write_roots.is_empty());
+        assert_eq!(cfg.fs.backup_dir, PathBuf::from("/var/backups/opsmcp"));
+        assert!(cfg.monitoring.icinga_url.is_none());
+        assert_eq!(cfg.monitoring.max_minutes, 240);
+        assert_eq!(cfg.haproxy.socket, PathBuf::from("/run/haproxy/admin.sock"));
+        assert!(cfg.storage.reclaim.is_empty());
+        assert!(cfg.storage.extendable.is_empty());
+        assert_eq!(cfg.storage.max_extend_gb, 50);
+        assert!(cfg.firewall.sets.is_empty());
+        assert!(cfg.trace.processes.is_empty());
+        assert!(!cfg.trace.system_wide);
+        assert_eq!(cfg.db.postgres_user, "postgres");
+        assert!(!cfg.db.show_queries);
+        assert!(!cfg.package.cve_online);
+    }
+
+    #[test]
+    fn the_settings_of_the_newer_tools_are_checked() {
+        assert_one_error_mentions("[fs]\nwrite_roots = [\"etc/nginx\"]\n", &["fs.write_roots"]);
+        assert_one_error_mentions("[fs]\nbackup_dir = \"backups\"\n", &["fs.backup_dir"]);
+        assert_one_error_mentions("[haproxy]\nsocket = \"admin.sock\"\n", &["haproxy.socket"]);
+        assert_one_error_mentions(
+            "[storage]\nreclaim = [\"journal\", \"everything\"]\n",
+            &["storage.reclaim", "everything", "package_cache"],
+        );
+        assert_one_error_mentions("[storage]\nextendable = [\"\"]\n", &["storage.extendable"]);
+        assert_one_error_mentions("[storage]\nmax_extend_gb = 0\n", &["storage.max_extend_gb"]);
+        assert_one_error_mentions("[firewall]\nsets = [\"\"]\n", &["firewall.sets"]);
+        assert_one_error_mentions("[trace]\nprocesses = [\"\"]\n", &["trace.processes"]);
+        assert_one_error_mentions("[db]\npostgres_user = \"-x\"\n", &["db.postgres_user"]);
+        assert_one_error_mentions(
+            "[db]\npatroni_config = \"patroni.yml\"\n",
+            &["db.patroni_config"],
+        );
+        assert_one_error_mentions(
+            "[db]\nmysql_defaults_file = \"my.cnf\"\n",
+            &["db.mysql_defaults_file"],
+        );
+        assert_one_error_mentions(
+            "[db]\npostgres_socket_dir = \"run\"\n",
+            &["db.postgres_socket_dir"],
+        );
+        let ok = "[fs]\nwrite_roots = [\"/etc/nginx\"]\nbackup_dir = \"/var/backups/x\"\n\
+                  [haproxy]\nsocket = \"/run/haproxy/admin.sock\"\n\
+                  [storage]\nreclaim = [\"journal\", \"core_dumps\"]\nextendable = [\"vg0/*\"]\nmax_extend_gb = 20\n\
+                  [firewall]\nsets = [\"nft/inet/filter/blocklist\", \"ipset/*\"]\n\
+                  [trace]\nprocesses = [\"www-data/*\"]\nsystem_wide = true\n\
+                  [db]\npostgres_user = \"postgres\"\npatroni_config = \"/etc/patroni/patroni.yml\"\nshow_queries = true\n\
+                  [package]\ncve_online = true\n";
+        assert_eq!(errors(ok), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_monitoring_settings_must_be_complete_and_use_https() {
+        let whole = "[monitoring]\nicinga_url = \"https://icinga.example.com:5665\"\n\
+                     icinga_user = \"opsmcp\"\nicinga_password_file = \"/etc/opsmcp/icinga.password\"\n\
+                     icinga_ca = \"/etc/ssl/ca.pem\"\nhost = \"web1.example.com\"\nmax_minutes = 120\n";
+        assert_eq!(errors(whole), Vec::<String>::new());
+        // a password is never sent anywhere but over TLS
+        assert_one_error_mentions(
+            "[monitoring]\nicinga_url = \"http://icinga.example.com:5665\"\n\
+             icinga_user = \"opsmcp\"\nicinga_password_file = \"/etc/opsmcp/p\"\n",
+            &["monitoring.icinga_url", "https://"],
+        );
+        assert_one_error_mentions(
+            "[monitoring]\nicinga_url = \"https://icinga.example.com\"\n",
+            &["icinga_user", "icinga_password_file"],
+        );
+        assert_one_error_mentions(
+            "[monitoring]\nicinga_url = \"https://icinga.example.com\"\n\
+             icinga_user = \"a:b\"\nicinga_password_file = \"/etc/opsmcp/p\"\n",
+            &["monitoring.icinga_user"],
+        );
+        assert_one_error_mentions(
+            "[monitoring]\nicinga_url = \"https://icinga.example.com\"\n\
+             icinga_user = \"opsmcp\"\nicinga_password_file = \"p\"\n",
+            &["monitoring.icinga_password_file"],
+        );
+        assert_one_error_mentions("[monitoring]\nhost = \"web 1\"\n", &["monitoring.host"]);
+        assert_one_error_mentions(
+            "[monitoring]\nmax_minutes = 0\n",
+            &["monitoring.max_minutes"],
+        );
+    }
+
+    #[test]
+    fn an_https_origin_is_a_host_and_a_port_and_nothing_else() {
+        let ok = |url: &str| parse_https_origin(url, 5665).unwrap();
+        assert_eq!(
+            ok("https://icinga.example.com"),
+            ("icinga.example.com".to_string(), 5665)
+        );
+        assert_eq!(
+            ok("https://Icinga.Example.com:8443/"),
+            ("icinga.example.com".to_string(), 8443)
+        );
+        assert_eq!(ok("https://10.0.0.5:5665"), ("10.0.0.5".to_string(), 5665));
+        for bad in [
+            "http://icinga.example.com",
+            "icinga.example.com",
+            "https://",
+            "https://user:pw@icinga.example.com",
+            "https://user@icinga.example.com",
+            "https://icinga.example.com/v1",
+            "https://icinga.example.com:0",
+            "https://icinga.example.com:99999",
+            "https://icinga.example.com:port",
+            "https://icinga example.com",
+            "https://-icinga.example.com",
+            "https://icinga.example.com?x=1",
+            "https://icinga.example.com#x",
+        ] {
+            assert!(parse_https_origin(bad, 5665).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_host_name_is_dns_labels_only() {
+        for good in ["web1", "web1.example.com", "a-b.example.com", "10.0.0.5"] {
+            assert!(is_host_name(good), "{good}");
+        }
+        for bad in [
+            "", "web 1", "web1.", ".web1", "-web1", "web1-", "web_1", "a..b", "web1/x", "[::1]",
+        ] {
+            assert!(!is_host_name(bad), "{bad}");
+        }
+        assert!(!is_host_name(&"a".repeat(254)));
+        assert!(!is_host_name(&format!("{}.com", "a".repeat(64))));
     }
 
     fn custom(body: &str) -> String {
