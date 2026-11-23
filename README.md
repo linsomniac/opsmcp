@@ -67,11 +67,28 @@ Each [release](https://github.com/linsomniac/opsmcp/releases) has these, with a
 sudo apt install ./opsmcp_0.1.0_ubuntu26.04_amd64.deb
 ```
 
-The package installs `/usr/bin/opsmcp`, the two unit files, and the examples under
-`/usr/share/opsmcp/examples`. It switches nothing on: there is no configuration, no
-sudoers rule and no enabled service until you add them, and nobody can use opsmcp until
-`/etc/opsmcp/config.toml` gives them a role. Removing the package leaves `/etc/opsmcp`
-alone.
+The package installs `/usr/bin/opsmcp`, the two unit files (not enabled), and:
+
+| File | As installed |
+| --- | --- |
+| `/etc/opsmcp/config.toml` | this host's configuration: two roles and no caller, so nobody can use opsmcp until you add one |
+| `/etc/opsmcp/fleet.toml`, `/etc/opsmcp/fleet/hosts.toml` | the configuration and the hosts of a [fleet server](#fleets-one-connection-to-many-hosts), for a bastion: no rule, no caller and no host, so it does not start until you write them. Never read on any other machine |
+| `/etc/opsmcp/sudoers.example` | the sudo rule that lets a group start opsmcp as root, as an example. No package writes to `/etc/sudoers.d`: installing the rule is your step, and the file says how |
+| `/usr/share/opsmcp/examples/` | every setting of those three configuration files, with examples |
+
+So installing it switches nothing on: start with `sudoedit /etc/opsmcp/config.toml`,
+then `sudo opsmcp check-config`.
+
+The files in `/etc/opsmcp` are conffiles, which dpkg handles as it does any other
+package's. The three configuration files belong to root with mode 640. What you change
+in them is kept on upgrade, and so are the owner and mode you give them. When a release
+changes a file that you have changed too, dpkg asks which to keep. Told to keep yours
+(`-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold`, which
+Ansible's `apt` module passes unless told otherwise), it writes the new one beside it as
+`config.toml.dpkg-dist`; an upgrade with no terminal and without those options stops at
+the question. A configuration that was already there when the package is first
+installed is treated the same way. Removing the package leaves `/etc/opsmcp` as it is;
+purging it takes those four files and nothing else from there.
 
 The binary in the tarball looks users and groups up in `/etc/passwd` and `/etc/group`
 only (see [below](#building-for-other-hosts)); the one in the `.deb` uses the system's
@@ -1274,7 +1291,7 @@ No `unsafe` code. The layout:
 | `src/tools/` | the tools, one file per area; `paths.rs` is the safe way to open a path, and `mod.rs` holds the test stand-ins (`FakeBins`) |
 | `src/fleet/` | the fleet server: `inventory.rs` (hosts and how callers name them), `access.rs` (which rule decides), `mod.rs` (the order of checks for a call), `ssh.rs`, `https.rs` and `link.rs` (reaching a host), `pool.rs` (sessions kept open, hosts left alone), `merge.rs` (several hosts' answers as one), `setup.rs` (reading the inventory and credentials, and keeping the inventory current) |
 | `tests/cli.rs` | end-to-end tests |
-| `scripts/`, `packaging/`, `nix/`, `flake.nix` | packaging: the script that makes the tarballs and the `.deb`, the unit files and examples they carry, and the Nix package, NixOS module and its test |
+| `scripts/`, `packaging/`, `nix/`, `flake.nix` | packaging: the script that makes the tarballs and the `.deb`, the unit files and examples they carry, the configuration files the `.deb` installs (`packaging/deb/etc`), and the Nix package, NixOS module and its test |
 
 Comments marked `AIDEV-NOTE:` explain the decisions that the security of the whole
 rests on; `grep -rn AIDEV- src/` lists them.

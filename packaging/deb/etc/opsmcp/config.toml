@@ -1,0 +1,27 @@
+# opsmcp configuration for this host: who may use opsmcp here, and what they may do.
+#
+# As installed, nobody can: no caller is listed. Add yourself below, then check the file:
+#
+#     opsmcp check-config
+#
+# Every setting, with examples, is in /usr/share/opsmcp/examples/config.example.toml.
+# This file must stay owned by root and writable by nobody else.
+#
+# Callers who need root for a tool start opsmcp through sudo. The rule for that is in
+# /etc/opsmcp/sudoers.example, and installing it is left to you.
+
+[roles.readonly]
+allow = ["@read"]
+
+[roles.admin]
+allow = ["@all"]
+
+# [unix_users.alice]
+# roles = ["admin"]
+#
+# [unix_groups.ops]
+# roles = ["readonly"]
+
+[audit]
+syslog = true
+fail_closed = true

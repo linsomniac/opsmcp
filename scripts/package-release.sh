@@ -15,8 +15,15 @@
 #
 # AIDEV-NOTE: the GitHub workflows and a developer's machine both package with this one
 # script, so that what CI checks is what a release ships. Neither kind of package
-# switches anything on: no configuration, no sudoers rule and no running service. Who
-# may do what on a host is the operator's to write (see the README).
+# switches anything on: no caller, no sudoers rule and no running service. Who may do
+# what on a host is the operator's to write (see the README). The .deb does install
+# configuration files, in /etc/opsmcp, as dpkg conffiles: files that let nobody in
+# (packaging/deb/etc, and the tests that keep them so).
+#
+# AIDEV-NOTE: no package ever writes to /etc/sudoers.d. That is the project owner's
+# rule ("We should never write a config file to sudoers.d"), not a detail of this
+# script: the sudo rule ships as an example, in /etc/opsmcp for the .deb, and
+# installing it is the operator's own step.
 set -euo pipefail
 
 usage() {
@@ -66,7 +73,9 @@ stage=$(mktemp -d "${TMPDIR:-/tmp}/opsmcp-package.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 
 homepage=https://github.com/linsomniac/opsmcp
-examples=(config.example.toml fleet.example.toml hosts.example.toml sudoers.example)
+# The full examples of the three configuration files, and the sudo rule.
+examples=(config.example.toml fleet.example.toml hosts.example.toml)
+sudoers_example=sudoers.example
 units=(opsmcp-http.service opsmcp-fleet-http.service)
 
 # The binary as shipped: stripped, since the release profile keeps its symbols.
@@ -83,7 +92,7 @@ if [[ $kind == tarball ]]; then
     install -m 0755 "$shipped" "$root/opsmcp"
     install -m 0644 "$repo_root/README.md" "$root/README.md"
     install -m 0644 "$repo_root/LICENSE" "$root/LICENSE"
-    for file in "${examples[@]}"; do
+    for file in "${examples[@]}" "$sudoers_example"; do
         install -m 0644 "$repo_root/packaging/$file" "$root/examples/$file"
     done
     for file in "${units[@]}"; do
@@ -124,8 +133,9 @@ doc="$root/usr/share/doc/opsmcp"
 # out except the copyright file, and an operator needs the examples to write a
 # configuration at all.
 examples_dir="$root/usr/share/opsmcp/examples"
+etc="$root/etc/opsmcp"
 mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/systemd/system" "$doc" \
-    "$examples_dir" "$root/etc/opsmcp"
+    "$examples_dir" "$etc/fleet"
 install -m 0755 "$shipped" "$root/usr/bin/opsmcp"
 install -m 0644 "$repo_root/README.md" "$doc/README.md"
 # AIDEV-NOTE: opsmcp is CC0 (LICENSE). Debian's place for a package's licence is its
@@ -135,8 +145,22 @@ install -m 0644 "$repo_root/LICENSE" "$doc/copyright"
 for file in "${examples[@]}"; do
     install -m 0644 "$repo_root/packaging/$file" "$examples_dir/$file"
 done
-# The units are installed and left alone: each needs a configuration before it can
-# start, so neither is enabled.
+# The configuration files, where opsmcp reads them. As installed they let nobody in
+# (see the note at the top), and they are not readable by everyone: who has which role
+# and which hosts there are is nobody's business but root's until the operator says so.
+# dpkg keeps an operator's changes to a conffile, and its owner and mode, on upgrade.
+conffiles=(config.toml fleet.toml fleet/hosts.toml)
+for file in "${conffiles[@]}"; do
+    install -m 0640 "$repo_root/packaging/deb/etc/opsmcp/$file" "$etc/$file"
+done
+# The sudo rule sits beside them as an example and nowhere else: /etc/sudoers.d is
+# never written to.
+install -m 0644 "$repo_root/packaging/$sudoers_example" "$etc/$sudoers_example"
+conffiles+=("$sudoers_example")
+printf '/etc/opsmcp/%s\n' "${conffiles[@]}" >"$root/DEBIAN/conffiles"
+chmod 0644 "$root/DEBIAN/conffiles"
+# The units are installed and left alone: each needs a configuration that lets
+# someone in before it is of any use, so neither is enabled.
 for file in "${units[@]}"; do
     install -m 0644 "$repo_root/packaging/$file" "$root/usr/lib/systemd/system/$file"
 done
@@ -173,11 +197,12 @@ installed_size=$(du -sk --exclude=DEBIAN "$root" | awk '{ print $1 }')
     echo " What a caller may do is decided by roles in /etc/opsmcp/config.toml, and every"
     echo " call is written to an audit trail."
     echo " ."
-    echo " Installing this package switches nothing on: there is no configuration, no"
-    echo " sudoers rule and no running service until you add them. Examples are in"
-    echo " /usr/share/opsmcp/examples."
+    echo " Installing this package switches nothing on: the configuration it puts in"
+    echo " /etc/opsmcp lists no caller, and there is no sudoers rule and no running"
+    echo " service until you add them. Examples are in /usr/share/opsmcp/examples."
 } >"$root/DEBIAN/control"
 chmod 0644 "$root/DEBIAN/control"
+# Checksums of everything but the conffiles, which dpkg tracks by itself.
 (cd "$root" && find usr -type f -print0 | LC_ALL=C sort -z | xargs -0 md5sum) >"$root/DEBIAN/md5sums"
 chmod 0644 "$root/DEBIAN/md5sums"
 

@@ -1327,6 +1327,34 @@ roles = ["operator"]
         assert!(cfg.http.is_some());
     }
 
+    // AIDEV-NOTE: the .deb installs this file as /etc/opsmcp/config.toml on every machine
+    // the package goes onto, so what it lists is listed everywhere at once. It has to
+    // stay a file that lets nobody in and opens nothing: a caller, a listener or an
+    // allowance added to it is a change to every installation, not an example. Examples
+    // belong in packaging/config.example.toml.
+    #[test]
+    fn the_configuration_the_package_installs_is_valid_and_lets_nobody_in() {
+        let installed = include_str!("../../packaging/deb/etc/opsmcp/config.toml");
+        let mut cfg = Config::parse(installed).unwrap();
+        let (_, warnings) = Registry::build(&cfg).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+
+        assert!(cfg.unix_users.is_empty());
+        assert!(cfg.unix_groups.is_empty());
+        assert!(cfg.tokens.is_empty());
+        assert!(cfg.client_certs.is_empty());
+        assert!(cfg.http.is_none());
+        // every call is recorded, and none runs when it cannot be
+        assert!(cfg.audit.syslog && cfg.audit.fail_closed);
+
+        // It names roles for the operator to hand out. Apart from those it sets nothing
+        // that an empty file does not: no custom tool, nothing writable, no fleet.
+        assert!(!cfg.roles.is_empty());
+        cfg.roles.clear();
+        let empty = Config::parse("").unwrap();
+        assert_eq!(format!("{cfg:#?}"), format!("{empty:#?}"));
+    }
+
     #[test]
     fn build_leaves_out_disabled_tools_and_rejects_unknown_names() {
         let (registry, _) =

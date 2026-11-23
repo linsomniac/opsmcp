@@ -1508,6 +1508,42 @@ mod tests {
         );
     }
 
+    // AIDEV-NOTE: the .deb installs these two files on every machine the package goes
+    // onto, most of which are not fleet servers. As installed they must not be a fleet
+    // server that works: no rule, no caller and no host, so that `opsmcp fleet` refuses
+    // to start until the operator has written who reaches what. Examples belong in
+    // packaging/fleet.example.toml and packaging/hosts.example.toml.
+    #[test]
+    fn the_fleet_configuration_the_package_installs_does_not_start_as_it_is() {
+        let installed = include_str!("../../packaging/deb/etc/opsmcp/fleet.toml");
+        let errors = Config::parse(installed).err().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("there are no [[fleet.access]] rules"),
+            "{errors:?}"
+        );
+        // Its only fault is the missing rule: with one, it is a fleet server that nobody
+        // can call, reading the inventory the package puts beside it.
+        let with_a_rule = format!(
+            "{installed}\n[[fleet.access]]\nname = \"r\"\nroles = [\"ops\"]\nhosts = [\"*\"]\n\
+             via = \"ssh\"\nidentity = \"caller\"\n"
+        );
+        let cfg = Config::parse(&with_a_rule).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(cfg.unix_users.is_empty());
+        assert!(cfg.unix_groups.is_empty());
+        assert!(cfg.tokens.is_empty());
+        assert!(cfg.client_certs.is_empty());
+        assert!(cfg.http.is_none());
+        assert_eq!(
+            cfg.fleet.as_ref().unwrap().inventory.as_deref(),
+            Some(Path::new("/etc/opsmcp/fleet/hosts.toml"))
+        );
+
+        // and that inventory names no host, which is an error of its own
+        let hosts = include_str!("../../packaging/deb/etc/opsmcp/fleet/hosts.toml");
+        assert!(Inventory::parse(hosts, Format::Toml).is_err());
+    }
+
     #[test]
     fn the_built_in_tools_leave_room_for_the_fleets_own_argument_and_tools() {
         let cfg = Config::parse("").unwrap();

@@ -1,0 +1,43 @@
+# opsmcp fleet server configuration: one MCP connection in front of many hosts. Only a
+# machine that runs `opsmcp fleet` or `opsmcp fleet-http` (a bastion) uses this file. On
+# any other host it is never read, and can be left as it is.
+#
+# As installed, a fleet server does not start: there is no rule below saying who reaches
+# which hosts, no caller, and no host in /etc/opsmcp/fleet/hosts.toml. After every change:
+#
+#     opsmcp check-config --config /etc/opsmcp/fleet.toml
+#
+# Every setting, with examples, is in /usr/share/opsmcp/examples/fleet.example.toml.
+#
+# This file must stay owned by root, or by the account the fleet server runs as, and
+# writable by nobody else. Whoever starts the fleet server has to be able to read it and
+# the inventory. Root can. For people who start it as themselves (`ssh bastion opsmcp
+# fleet`), or for the account of the opsmcp-fleet-http service, give their group read
+# access:
+#
+#     chgrp GROUP /etc/opsmcp/fleet.toml /etc/opsmcp/fleet/hosts.toml
+
+[roles.ops]
+allow = ["@all"]
+
+[roles.dev]
+allow = ["@read"]
+
+# [unix_groups.ops]
+# roles = ["ops"]
+
+[fleet]
+inventory = "/etc/opsmcp/fleet/hosts.toml"
+
+# The first rule that names one of the caller's roles and covers the host decides.
+#
+# [[fleet.access]]
+# name = "ops-own"
+# roles = ["ops"]
+# hosts = ["*"]
+# via = "ssh"
+# identity = "caller"
+
+[audit]
+syslog = true
+fail_closed = true

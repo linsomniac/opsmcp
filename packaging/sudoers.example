@@ -1,4 +1,11 @@
-# Install as /etc/sudoers.d/opsmcp (edit with: visudo -f /etc/sudoers.d/opsmcp).
+# sudo rules for opsmcp: an example. It does nothing where it is. sudo reads rules from
+# /etc/sudoers.d, and opsmcp's packages never put a file there: that step is yours. Set
+# the group below, then, in this file's directory:
+#
+#     visudo -cf sudoers.example        # check it first: a broken rule file breaks sudo
+#     install -o root -g root -m 0440 sudoers.example /etc/sudoers.d/opsmcp
+#
+# Change it afterwards with: visudo -f /etc/sudoers.d/opsmcp
 #
 # Lets members of group "ops" start the stdio server as root, and nothing else. sudo
 # matches the command and its arguments exactly, so `opsmcp serve --config /tmp/mine`

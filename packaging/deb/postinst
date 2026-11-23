@@ -1,6 +1,8 @@
 #!/bin/sh
-# Installing switches nothing on. This only tells systemd about the unit files and, on
-# an upgrade, has a server that is already running start again with the new binary.
+# Installing switches nothing on: the files dpkg puts in /etc/opsmcp list no caller,
+# and nothing is written anywhere else (never to /etc/sudoers.d). This only tells
+# systemd about the unit files and, on an upgrade, has a server that is already running
+# start again with the new binary.
 set -e
 
 if [ "$1" = configure ] && [ -d /run/systemd/system ]; then

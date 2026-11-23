@@ -1,6 +1,7 @@
 #!/bin/sh
-# /etc/opsmcp is the operator's and is left as it is, on purge too: the package never
-# wrote anything into it.
+# Nothing under /etc/opsmcp is removed here. dpkg itself takes away the configuration
+# files the package installed, and only on purge; whatever else is there (keys, tokens,
+# certificates) is the operator's and stays, on purge too.
 set -e
 
 if [ -d /run/systemd/system ]; then
