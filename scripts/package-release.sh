@@ -65,6 +65,7 @@ mkdir -p "$dist"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/opsmcp-package.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 
+homepage=https://github.com/linsomniac/opsmcp
 examples=(config.example.toml fleet.example.toml hosts.example.toml sudoers.example)
 units=(opsmcp-http.service opsmcp-fleet-http.service)
 
@@ -81,9 +82,7 @@ if [[ $kind == tarball ]]; then
     mkdir -p "$root/examples" "$root/systemd"
     install -m 0755 "$shipped" "$root/opsmcp"
     install -m 0644 "$repo_root/README.md" "$root/README.md"
-    if [[ -f $repo_root/LICENSE ]]; then
-        install -m 0644 "$repo_root/LICENSE" "$root/LICENSE"
-    fi
+    install -m 0644 "$repo_root/LICENSE" "$root/LICENSE"
     for file in "${examples[@]}"; do
         install -m 0644 "$repo_root/packaging/$file" "$root/examples/$file"
     done
@@ -129,14 +128,10 @@ mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/systemd/system" "$doc" \
     "$examples_dir" "$root/etc/opsmcp"
 install -m 0755 "$shipped" "$root/usr/bin/opsmcp"
 install -m 0644 "$repo_root/README.md" "$doc/README.md"
-if [[ -f $repo_root/LICENSE ]]; then
-    install -m 0644 "$repo_root/LICENSE" "$doc/copyright"
-else
-    # AIDEV-TODO: no licence has been chosen for opsmcp yet. Once there is a LICENSE
-    # file it is what gets installed here.
-    printf 'opsmcp\n\nNo licence has been granted for this software yet.\n' >"$doc/copyright"
-    chmod 0644 "$doc/copyright"
-fi
+# AIDEV-NOTE: opsmcp is CC0 (LICENSE). Debian's place for a package's licence is its
+# copyright file, which is also the one file under /usr/share/doc that minimal images
+# keep.
+install -m 0644 "$repo_root/LICENSE" "$doc/copyright"
 for file in "${examples[@]}"; do
     install -m 0644 "$repo_root/packaging/$file" "$examples_dir/$file"
 done
@@ -171,6 +166,7 @@ installed_size=$(du -sk --exclude=DEBIAN "$root" | awk '{ print $1 }')
     fi
     echo "Recommends: sudo"
     echo "Suggests: openssh-client"
+    echo "Homepage: $homepage"
     echo "Description: MCP server for audited, permission-controlled Linux operations"
     echo " opsmcp gives AI agents access to operations tasks on a host (services, logs,"
     echo " processes, packages, firewall and more) through the Model Context Protocol."

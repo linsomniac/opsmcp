@@ -36,6 +36,7 @@ One connection can also reach a whole fleet of such hosts: see
 - [Limits](#limits)
 - [Not included yet](#not-included-yet)
 - [Development](#development)
+- [License](#license)
 
 ## Quick start
 
@@ -54,7 +55,8 @@ identified and which tools you would be offered.
 
 ### Packages
 
-Each release has these, with a `SHA256SUMS` file:
+Each [release](https://github.com/linsomniac/opsmcp/releases) has these, with a
+`SHA256SUMS` file:
 
 | File | For |
 | --- | --- |
@@ -80,7 +82,7 @@ for the statically linked one), an overlay, and a module:
 
 ```nix
 {
-  inputs.opsmcp.url = "github:OWNER/REPO";
+  inputs.opsmcp.url = "github:linsomniac/opsmcp";
 
   outputs = { nixpkgs, opsmcp, ... }: {
     nixosConfigurations.web1 = nixpkgs.lib.nixosSystem {
@@ -1276,3 +1278,8 @@ No `unsafe` code. The layout:
 
 Comments marked `AIDEV-NOTE:` explain the decisions that the security of the whole
 rests on; `grep -rn AIDEV- src/` lists them.
+
+## License
+
+This project is dedicated to the public domain under the
+[CC0 1.0 Universal](LICENSE) public domain dedication.

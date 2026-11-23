@@ -41,7 +41,8 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = {
-    inherit (manifest) description;
+    inherit (manifest) description homepage;
+    license = lib.licenses.cc0;
     mainProgram = "opsmcp";
     platforms = lib.platforms.linux;
   };

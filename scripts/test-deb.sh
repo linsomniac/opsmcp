@@ -56,6 +56,10 @@ for file in \
     [[ $(($(stat -c '%#a' "$file") & 0022)) -eq 0 ]] || fail "$file is writable by others"
 done
 [[ $(stat -c '%a' /usr/bin/opsmcp) == 755 ]] || fail "/usr/bin/opsmcp is not mode 755"
+grep -q 'CC0 1.0 Universal' /usr/share/doc/opsmcp/copyright ||
+    fail "the copyright file does not carry the licence"
+[[ $(dpkg-deb -f "$deb" Homepage) == https://github.com/* ]] ||
+    fail "the package does not say where it comes from"
 [[ -d /etc/opsmcp ]] || fail "/etc/opsmcp is missing"
 
 check "installing switched nothing on"

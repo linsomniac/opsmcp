@@ -70,7 +70,7 @@ jobs:
           ./opsmcp --version
           # No loader and no shared libraries, so it runs on any distribution.
           file opsmcp | grep -Eq 'statically linked|static-pie linked'
-          for part in README.md examples/config.example.toml systemd/opsmcp-http.service; do
+          for part in README.md LICENSE examples/config.example.toml systemd/opsmcp-http.service; do
             test -f "$part"
           done
 

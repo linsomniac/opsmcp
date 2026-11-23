@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "MCP server giving AI agents audited, permission-controlled access to Linux operations tasks"
+license = "CC0-1.0"
+repository = "https://github.com/linsomniac/opsmcp"
+homepage = "https://github.com/linsomniac/opsmcp"
 publish = false
 
 [dependencies]
