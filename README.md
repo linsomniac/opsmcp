@@ -64,7 +64,7 @@ Each [release](https://github.com/linsomniac/opsmcp/releases) has these, with a
 | `opsmcp-VERSION-x86_64-unknown-linux-musl.tar.gz`, `...-aarch64-...` | any distribution: a statically linked binary, the examples and the unit files |
 
 ```sh
-sudo apt install ./opsmcp_0.1.0_ubuntu26.04_amd64.deb
+sudo apt install ./opsmcp_0.1.1_ubuntu26.04_amd64.deb
 ```
 
 The package installs `/usr/bin/opsmcp`, the two unit files (not enabled), and:
