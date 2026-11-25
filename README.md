@@ -17,7 +17,7 @@ editing, firewall-set, tracing and package-cache tools have been run against the
 programs in a test container (Patroni 3.2 and 4.1 on etcd, PostgreSQL 16, MariaDB
 10.11, HAProxy 2.8, sysstat, nftables, strace, apt). Much else has only been exercised
 against stand-in commands: Icinga, Galera, MySQL, rpm/dnf, LVM, ipset, smartctl, IPMI,
-Pacemaker, chrony, perf across a whole host, and the tools that change systemd units,
+dmidecode, Pacemaker, chrony, perf across a whole host, and the tools that change systemd units,
 sessions, accounts, packages and volumes. It has not yet run in production.
 
 One connection can also reach a whole fleet of such hosts: see
@@ -792,7 +792,7 @@ The "resource" column is what a grant's part after the colon is matched against.
 | `dns_config` | read | `net.view` | |
 | `cve_status` | read | `package.view` | |
 | `db_status` | read | `db.view` | engine: `mariadb`, `postgres` or `patroni` |
-| `hardware_health` | read | `hardware.view` | |
+| `hardware_health`, `hardware_info` | read | `hardware.view` | |
 | custom tools | as configured | `custom.NAME` | |
 
 Paths are always judged by where they really are, after links are resolved. A link in
@@ -1079,8 +1079,11 @@ and then says so.
 **Kernel and hardware.** `kernel_status` shows the running kernel, why it is tainted,
 out-of-tree modules, live patches and CPU vulnerability mitigations. `hardware_health`
 reads temperatures, fans, memory-error counters, power supplies and, where there is a
-management controller and `ipmitool`, its failing sensors and event log. On a virtual
-machine most of it is empty, and it says so.
+management controller and `ipmitool`, its failing sensors and event log. `hardware_info`
+reads the SMBIOS/DMI tables through `dmidecode` (system, BIOS, baseboard, chassis,
+processor sockets and memory slots by default, or any section in full) and falls back to
+`/sys/class/dmi/id` when `dmidecode` is absent or cannot read the tables. On a virtual
+machine most of both is empty, and they say so.
 
 ## Custom tools
 

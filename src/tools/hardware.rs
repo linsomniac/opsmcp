@@ -1,10 +1,10 @@
-//! Hardware health: sensors, memory errors, power, IPMI.
+//! Hardware health and inventory: sensors, memory errors, power, IPMI, SMBIOS/DMI.
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::args::Args;
+use super::args::{Args, Param};
 use super::{
     CallClock, Ctx, Tool, ToolError, ToolResult, blocking, command_ok, command_text, format_table,
     one_line_cell,
@@ -31,29 +31,71 @@ impl Default for Roots {
     }
 }
 
+const DMI_SECTIONS: [&str; 11] = [
+    "summary",
+    "bios",
+    "system",
+    "baseboard",
+    "chassis",
+    "processor",
+    "memory",
+    "cache",
+    "connector",
+    "slot",
+    "all",
+];
+
 pub fn tools() -> Vec<Tool> {
     tools_with(Roots::default())
 }
 
 pub fn tools_with(roots: Roots) -> Vec<Tool> {
     let roots = Arc::new(roots);
-    vec![Tool::new(
-        "hardware_health",
-        "Check this machine's hardware: temperatures and fans, corrected and uncorrected \
-         memory errors (EDAC), power supplies and batteries, CPU thermal throttling, \
-         hardware errors in the kernel log, and, where the machine has a management \
-         controller, the IPMI sensors that are not ok and its recent event log. The first \
-         line is the verdict. Use it when a host crashes or slows down for no visible \
-         reason. A virtual machine usually has nothing to show. For drives use \
-         disk_health.",
-        Access::Read,
-        "hardware.view",
-        vec![],
-        move |ctx, args| {
-            let roots = roots.clone();
-            async move { hardware_health(ctx, args, roots).await }
-        },
-    )]
+    let info_roots = roots.clone();
+    vec![
+        Tool::new(
+            "hardware_health",
+            "Check this machine's hardware: temperatures and fans, corrected and uncorrected \
+             memory errors (EDAC), power supplies and batteries, CPU thermal throttling, \
+             hardware errors in the kernel log, and, where the machine has a management \
+             controller, the IPMI sensors that are not ok and its recent event log. The first \
+             line is the verdict. Use it when a host crashes or slows down for no visible \
+             reason. A virtual machine usually has nothing to show. For hardware inventory \
+             (BIOS, CPUs, memory slots) use hardware_info; for drives use disk_health.",
+            Access::Read,
+            "hardware.view",
+            vec![],
+            move |ctx, args| {
+                let roots = roots.clone();
+                async move { hardware_health(ctx, args, roots).await }
+            },
+        ),
+        Tool::new(
+            "hardware_info",
+            "Show this machine's hardware inventory from SMBIOS/DMI (dmidecode): system \
+             vendor, model, serial number and UUID, BIOS/UEFI firmware, baseboard, chassis, \
+             processor sockets, and memory array and DIMM slots. By default returns a \
+             concise summary; pass `section` to inspect one SMBIOS section in full (bios, \
+             system, baseboard, chassis, processor, memory, cache, connector, slot) or all. \
+             Falls back to /sys/class/dmi/id when dmidecode is not installed or cannot read \
+             the SMBIOS tables. Virtual machines and containers may report minimal or no \
+             SMBIOS data. For sensors, memory errors and IPMI use hardware_health; for \
+             drives use block_devices or disk_health.",
+            Access::Read,
+            "hardware.view",
+            vec![Param::choice(
+                "section",
+                "Which SMBIOS section to show: summary (default: structured overview of \
+                 system, BIOS, baseboard, chassis, processors and memory), or one of bios, \
+                 system, baseboard, chassis, processor, memory, cache, connector, slot, all",
+                &DMI_SECTIONS,
+            )],
+            move |ctx, args| {
+                let roots = info_roots.clone();
+                async move { hardware_info(ctx, args, roots).await }
+            },
+        ),
+    ]
 }
 
 /// The most that is read of any one of the kernel's small files.
@@ -949,6 +991,1035 @@ async fn hardware_health(ctx: Ctx, _args: Args, roots: Arc<Roots>) -> ToolResult
     ))
 }
 
+// ---- hardware_info (SMBIOS / DMI) ----------------------------------------------------
+
+/// Limits for parsing `dmidecode` output so pathological firmware tables stay bounded.
+const MAX_DMI_LINES: usize = 20_000;
+const MAX_DMI_BLOCKS: usize = 512;
+const MAX_DMI_FIELDS: usize = 128;
+const MAX_PROCESSORS: usize = 64;
+const MAX_DIMMS: usize = 128;
+const MAX_EMPTY_SLOTS_SHOWN: usize = 16;
+
+/// One SMBIOS structure block from `dmidecode` (for example `BIOS Information` or
+/// `Memory Device`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DmiBlock {
+    pub title: String,
+    pub fields: Vec<(String, String)>,
+    /// Multi-line list items (such as `Characteristics` under `BIOS Information`),
+    /// stored as `(field_name, items)`.
+    pub lists: Vec<(String, Vec<String>)>,
+}
+
+impl DmiBlock {
+    pub fn field(&self, key: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn meaningful(&self, key: &str) -> Option<&str> {
+        self.field(key).filter(|v| !is_dmi_placeholder(v))
+    }
+
+    pub fn list(&self, key: &str) -> &[String] {
+        self.lists
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, items)| items.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// True when a DMI string is a firmware placeholder rather than a real value.
+pub fn is_dmi_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "not specified"
+            | "not provided"
+            | "not present"
+            | "not available"
+            | "not installed"
+            | "none"
+            | "unknown"
+            | "n/a"
+            | "to be filled by o.e.m."
+            | "default string"
+            | "o.e.m."
+            | "oem"
+            | "tbd"
+            | "system manufacturer"
+            | "system product name"
+            | "system version"
+            | "system serial number"
+            | "base board serial number"
+            | "chassis serial number"
+            | "no asset tag"
+            | "no asset information"
+            | "asset-1234567890"
+            | "00000000"
+            | "0000000000"
+            | "0123456789"
+            | "123456789"
+    )
+}
+
+/// Parses `dmidecode` output (with or without `-q`) into structured blocks.
+pub fn parse_dmidecode(text: &str) -> Vec<DmiBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Option<DmiBlock> = None;
+    let mut current_field: Option<String> = None;
+
+    let flush = |blocks: &mut Vec<DmiBlock>, current: &mut Option<DmiBlock>| {
+        if let Some(block) = current.take()
+            && !block.title.is_empty()
+            && blocks.len() < MAX_DMI_BLOCKS
+        {
+            blocks.push(block);
+        }
+    };
+
+    for raw in text.lines().take(MAX_DMI_LINES) {
+        let line = raw.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            flush(&mut blocks, &mut current);
+            current_field = None;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(['\t', ' ']) {
+            if line.starts_with("Handle 0x") {
+                flush(&mut blocks, &mut current);
+                current_field = None;
+                continue;
+            }
+            flush(&mut blocks, &mut current);
+            current_field = None;
+            if trimmed == "End Of Table" {
+                continue;
+            }
+            current = Some(DmiBlock {
+                title: trimmed.to_string(),
+                fields: Vec::new(),
+                lists: Vec::new(),
+            });
+            continue;
+        }
+        let Some(block) = current.as_mut() else {
+            continue;
+        };
+        let is_list_item = line.starts_with("\t\t") || line.starts_with("        ");
+        if is_list_item {
+            if let Some(field) = current_field.as_deref() {
+                push_list_item(block, field, trimmed);
+            }
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let val = val.trim();
+            current_field = Some(key.to_string());
+            if !val.is_empty() && block.fields.len() < MAX_DMI_FIELDS {
+                block.fields.push((key.to_string(), val.to_string()));
+            }
+        } else if let Some(field) = current_field.as_deref() {
+            push_list_item(block, field, trimmed);
+        }
+    }
+    flush(&mut blocks, &mut current);
+    blocks
+}
+
+fn push_list_item(block: &mut DmiBlock, field: &str, item: &str) {
+    if let Some((_, items)) = block.lists.last_mut().filter(|(k, _)| k == field) {
+        if items.len() < MAX_DMI_FIELDS {
+            items.push(item.to_string());
+        }
+    } else if block.lists.len() < MAX_DMI_FIELDS {
+        block
+            .lists
+            .push((field.to_string(), vec![item.to_string()]));
+    }
+}
+
+/// True when a Type 17 `Size` value means the memory slot is empty.
+fn is_empty_dimm_size(size: &str) -> bool {
+    let lower = size.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || matches!(
+            lower.as_str(),
+            "no module installed" | "not installed" | "unknown" | "none" | "0"
+        )
+        || lower.starts_with("0 ")
+}
+
+/// Parses a `dmidecode` memory size such as `32 GB`, `16384 MB` or `1 TB` into KiB.
+/// Returns `None` for empty slots, zero, or unrecognized strings.
+pub fn parse_dmi_memory_kib(size: &str) -> Option<u64> {
+    let mut parts = size.split_whitespace();
+    let number: u64 = parts.next()?.parse().ok()?;
+    let unit = parts.next()?;
+    if parts.next().is_some() || number == 0 {
+        return None;
+    }
+    match unit {
+        "kB" | "KB" | "KiB" => Some(number),
+        "MB" | "MiB" => number.checked_mul(1024),
+        "GB" | "GiB" => number.checked_mul(1024 * 1024),
+        "TB" | "TiB" => number.checked_mul(1024 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+/// Formats a KiB memory total in SMBIOS/dmidecode units (`TB`, `GB`, `MB`, `kB`).
+pub fn format_dmi_kib(kib: u64) -> String {
+    const MIB: u64 = 1024;
+    const GIB: u64 = 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024;
+    let format_unit = |unit: u64, suffix: &str| {
+        if kib.is_multiple_of(unit) {
+            format!("{} {suffix}", kib / unit)
+        } else {
+            format!("{:.1} {suffix}", kib as f64 / unit as f64)
+        }
+    };
+    if kib >= TIB {
+        format_unit(TIB, "TB")
+    } else if kib >= GIB {
+        format_unit(GIB, "GB")
+    } else if kib >= MIB {
+        format_unit(MIB, "MB")
+    } else {
+        format!("{kib} kB")
+    }
+}
+
+/// Formats aligned `Key: value` lines, sanitizing every value onto one line.
+fn format_kv(rows: &[(&str, String)]) -> String {
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (key, value) in rows {
+        let pad = " ".repeat(width.saturating_sub(key.len()));
+        out.push_str(&format!("{key}:{pad} {}\n", shown(value, 120)));
+    }
+    out
+}
+
+/// Formats the `Machine: ...` one-line headline from vendor/product and BIOS version/date.
+fn machine_headline(
+    vendor: Option<&str>,
+    product: Option<&str>,
+    bios_version: Option<&str>,
+    bios_date: Option<&str>,
+) -> Option<String> {
+    let model: Vec<String> = [vendor, product]
+        .into_iter()
+        .flatten()
+        .map(|v| shown(v, 80))
+        .collect();
+    let bios = match (bios_version, bios_date) {
+        (Some(version), Some(date)) => {
+            Some(format!("BIOS {} ({})", shown(version, 80), shown(date, 40)))
+        }
+        (Some(version), None) => Some(format!("BIOS {}", shown(version, 80))),
+        (None, _) => None,
+    };
+    let parts: Vec<String> = [(!model.is_empty()).then(|| model.join(" ")), bios]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// Builds a concise, structured summary from parsed `dmidecode` blocks.
+pub fn format_dmi_summary(blocks: &[DmiBlock]) -> String {
+    let first = |title: &str| blocks.iter().find(|b| b.title == title);
+    let system = first("System Information");
+    let bios = first("BIOS Information");
+    let baseboard = first("Base Board Information");
+    let chassis = first("Chassis Information");
+
+    let mut out = String::new();
+    if let Some(headline) = machine_headline(
+        system.and_then(|b| b.meaningful("Manufacturer")),
+        system.and_then(|b| b.meaningful("Product Name")),
+        bios.and_then(|b| b.meaningful("Version")),
+        bios.and_then(|b| b.meaningful("Release Date")),
+    ) {
+        out.push_str(&format!("Machine: {headline}\n"));
+    }
+
+    if let Some(b) = system {
+        let mut rows = Vec::new();
+        for (label, key) in [
+            ("Manufacturer", "Manufacturer"),
+            ("Product", "Product Name"),
+            ("Version", "Version"),
+            ("Serial", "Serial Number"),
+            ("UUID", "UUID"),
+            ("SKU", "SKU Number"),
+            ("Family", "Family"),
+        ] {
+            if let Some(val) = b.meaningful(key) {
+                rows.push((label, val.to_string()));
+            }
+        }
+        if !rows.is_empty() {
+            out.push_str("== system ==\n");
+            out.push_str(&format_kv(&rows));
+        }
+    }
+
+    if let Some(b) = bios {
+        let mut rows = Vec::new();
+        for (label, key) in [
+            ("Vendor", "Vendor"),
+            ("Version", "Version"),
+            ("Release Date", "Release Date"),
+            ("BIOS Revision", "BIOS Revision"),
+            ("Firmware", "Firmware Revision"),
+        ] {
+            if let Some(val) = b.meaningful(key) {
+                rows.push((label, val.to_string()));
+            }
+        }
+        if b.list("Characteristics")
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("UEFI is supported"))
+        {
+            rows.push(("Boot Mode", "UEFI".to_string()));
+        }
+        if !rows.is_empty() {
+            out.push_str("== BIOS ==\n");
+            out.push_str(&format_kv(&rows));
+        }
+    }
+
+    if let Some(b) = baseboard {
+        let mut rows = Vec::new();
+        for (label, key) in [
+            ("Manufacturer", "Manufacturer"),
+            ("Product", "Product Name"),
+            ("Version", "Version"),
+            ("Serial", "Serial Number"),
+            ("Asset Tag", "Asset Tag"),
+        ] {
+            if let Some(val) = b.meaningful(key) {
+                rows.push((label, val.to_string()));
+            }
+        }
+        if !rows.is_empty() {
+            out.push_str("== baseboard ==\n");
+            out.push_str(&format_kv(&rows));
+        }
+    }
+
+    if let Some(b) = chassis {
+        let mut rows = Vec::new();
+        for (label, key) in [
+            ("Manufacturer", "Manufacturer"),
+            ("Type", "Type"),
+            ("Version", "Version"),
+            ("Serial", "Serial Number"),
+            ("Asset Tag", "Asset Tag"),
+        ] {
+            if let Some(val) = b.meaningful(key) {
+                rows.push((label, val.to_string()));
+            }
+        }
+        if !rows.is_empty() {
+            out.push_str("== chassis ==\n");
+            out.push_str(&format_kv(&rows));
+        }
+    }
+
+    let processors: Vec<&DmiBlock> = blocks
+        .iter()
+        .filter(|b| b.title == "Processor Information")
+        .collect();
+    if !processors.is_empty() {
+        out.push_str("== processors ==\n");
+        let rows: Vec<Vec<String>> = processors
+            .iter()
+            .take(MAX_PROCESSORS)
+            .map(|p| {
+                let socket = p
+                    .meaningful("Socket Designation")
+                    .map(|v| shown(v, 32))
+                    .unwrap_or_else(|| "-".to_string());
+                let model = p
+                    .meaningful("Version")
+                    .or_else(|| p.meaningful("Family"))
+                    .or_else(|| p.meaningful("Manufacturer"))
+                    .map(|v| shown(v, 64))
+                    .unwrap_or_else(|| "-".to_string());
+                let cores = format_processor_cores(p);
+                let speed =
+                    format_speed_pair(p.meaningful("Current Speed"), p.meaningful("Max Speed"));
+                let status = p
+                    .meaningful("Status")
+                    .map(|v| shown(v, 32))
+                    .unwrap_or_else(|| "-".to_string());
+                vec![socket, model, cores, speed, status]
+            })
+            .collect();
+        out.push_str(&format_table(
+            &["SOCKET", "MODEL", "CORES/THREADS", "SPEED", "STATUS"],
+            &rows,
+            &[false, false, false, false, false],
+        ));
+        if processors.len() > MAX_PROCESSORS {
+            out.push_str(&format!(
+                "[{} more processors not shown]\n",
+                processors.len() - MAX_PROCESSORS
+            ));
+        }
+    }
+
+    let arrays: Vec<&DmiBlock> = blocks
+        .iter()
+        .filter(|b| b.title == "Physical Memory Array")
+        .collect();
+    let devices: Vec<&DmiBlock> = blocks
+        .iter()
+        .filter(|b| b.title == "Memory Device")
+        .collect();
+    if !arrays.is_empty() || !devices.is_empty() {
+        out.push_str("== memory ==\n");
+        format_memory_section(&arrays, &devices, &mut out);
+    }
+
+    out
+}
+
+fn format_processor_cores(p: &DmiBlock) -> String {
+    let cores = p.meaningful("Core Count");
+    let enabled = p.meaningful("Core Enabled");
+    let threads = p.meaningful("Thread Count");
+    let core_part = match (cores, enabled) {
+        (Some(c), Some(e)) if e != c => Some(format!("{} of {}c", shown(e, 8), shown(c, 8))),
+        (Some(c), _) => Some(format!("{}c", shown(c, 8))),
+        (None, Some(e)) => Some(format!("{}c", shown(e, 8))),
+        (None, None) => None,
+    };
+    match (core_part, threads) {
+        (Some(c), Some(t)) => format!("{c}/{}t", shown(t, 8)),
+        (Some(c), None) => c,
+        (None, Some(t)) => format!("{}t", shown(t, 8)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn format_speed_pair(current: Option<&str>, max: Option<&str>) -> String {
+    match (current, max) {
+        (Some(cur), Some(mx)) if cur != mx => {
+            format!("{} (max {})", shown(cur, 20), shown(mx, 20))
+        }
+        (Some(cur), _) => shown(cur, 24),
+        (None, Some(mx)) => shown(mx, 24),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn format_memory_section(arrays: &[&DmiBlock], devices: &[&DmiBlock], out: &mut String) {
+    // Prefer System Memory arrays so BIOS flash arrays do not skew RAM totals.
+    let system_arrays: Vec<&DmiBlock> = arrays
+        .iter()
+        .copied()
+        .filter(|a| {
+            a.field("Use")
+                .is_some_and(|u| u.eq_ignore_ascii_case("System Memory"))
+        })
+        .collect();
+    let relevant_arrays = if system_arrays.is_empty() {
+        arrays
+    } else {
+        system_arrays.as_slice()
+    };
+
+    let mut populated = Vec::new();
+    let mut empty_locators = Vec::new();
+    let mut total_kib = 0u64;
+    let mut parsed_any_size = false;
+    for dev in devices {
+        let size = dev.field("Size").unwrap_or("");
+        if is_empty_dimm_size(size) {
+            let loc = dev
+                .meaningful("Locator")
+                .or_else(|| dev.meaningful("Bank Locator"))
+                .map(|v| shown(v, 32));
+            empty_locators.push(loc);
+            continue;
+        }
+        if let Some(kib) = parse_dmi_memory_kib(size) {
+            total_kib = total_kib.saturating_add(kib);
+            parsed_any_size = true;
+        }
+        populated.push(*dev);
+    }
+
+    let array_slots: u64 = relevant_arrays
+        .iter()
+        .filter_map(|a| a.field("Number Of Devices")?.parse::<u64>().ok())
+        .fold(0u64, u64::saturating_add);
+    let total_slots = if !devices.is_empty() {
+        devices.len() as u64
+    } else {
+        array_slots
+    };
+
+    let mut details = Vec::new();
+    let mut max_kib = 0u64;
+    let mut max_parsed = !relevant_arrays.is_empty();
+    let mut max_raw = Vec::new();
+    let mut ecc_types = Vec::new();
+    for arr in relevant_arrays {
+        if let Some(cap) = arr.meaningful("Maximum Capacity") {
+            if let Some(kib) = parse_dmi_memory_kib(cap) {
+                max_kib = max_kib.saturating_add(kib);
+            } else {
+                max_parsed = false;
+                let s = shown(cap, 24);
+                if !max_raw.contains(&s) {
+                    max_raw.push(s);
+                }
+            }
+        } else {
+            max_parsed = false;
+        }
+        if let Some(ecc) = arr.field("Error Correction Type") {
+            let trimmed = ecc.trim();
+            if !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("Unknown")
+                && !trimmed.eq_ignore_ascii_case("Other")
+                && !trimmed.eq_ignore_ascii_case("Not Specified")
+            {
+                let label = if trimmed.eq_ignore_ascii_case("None") {
+                    "no ECC".to_string()
+                } else {
+                    shown(trimmed, 32)
+                };
+                if !ecc_types.contains(&label) {
+                    ecc_types.push(label);
+                }
+            }
+        }
+    }
+    if max_parsed && max_kib > 0 {
+        details.push(format!("max {}", format_dmi_kib(max_kib)));
+    } else if !max_raw.is_empty() {
+        details.push(format!("max {}", max_raw.join(" + ")));
+    }
+    if !ecc_types.is_empty() {
+        details.push(ecc_types.join(", "));
+    }
+    let detail_suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+
+    if parsed_any_size {
+        out.push_str(&format!(
+            "Total: {} installed across {} of {}{detail_suffix}\n",
+            format_dmi_kib(total_kib),
+            populated.len(),
+            count(total_slots, "slot", "slots"),
+        ));
+    } else if total_slots > 0 {
+        out.push_str(&format!(
+            "Total: {} populated of {}{detail_suffix}\n",
+            populated.len(),
+            count(total_slots, "slot", "slots"),
+        ));
+    } else if !details.is_empty() {
+        out.push_str(&format!("Array: {}\n", details.join(", ")));
+    }
+
+    if !populated.is_empty() {
+        let rows: Vec<Vec<String>> = populated
+            .iter()
+            .take(MAX_DIMMS)
+            .map(|d| {
+                let slot = d
+                    .meaningful("Locator")
+                    .or_else(|| d.meaningful("Bank Locator"))
+                    .map(|v| shown(v, 32))
+                    .unwrap_or_else(|| "-".to_string());
+                let size = d
+                    .field("Size")
+                    .map(|v| shown(v, 20))
+                    .unwrap_or_else(|| "-".to_string());
+                let kind = d
+                    .meaningful("Type")
+                    .map(|v| shown(v, 20))
+                    .unwrap_or_else(|| "-".to_string());
+                let configured = d
+                    .meaningful("Configured Memory Speed")
+                    .or_else(|| d.meaningful("Configured Clock Speed"));
+                let rated = d.meaningful("Speed");
+                let speed = format_speed_pair(configured, rated);
+                let manufacturer = d
+                    .meaningful("Manufacturer")
+                    .map(|v| shown(v, 28))
+                    .unwrap_or_else(|| "-".to_string());
+                let part = d
+                    .meaningful("Part Number")
+                    .map(|v| shown(v, 36))
+                    .unwrap_or_else(|| "-".to_string());
+                let serial = d
+                    .meaningful("Serial Number")
+                    .map(|v| shown(v, 28))
+                    .unwrap_or_else(|| "-".to_string());
+                vec![slot, size, kind, speed, manufacturer, part, serial]
+            })
+            .collect();
+        out.push_str(&format_table(
+            &[
+                "SLOT",
+                "SIZE",
+                "TYPE",
+                "SPEED",
+                "MANUFACTURER",
+                "PART",
+                "SERIAL",
+            ],
+            &rows,
+            &[false, true, false, false, false, false, false],
+        ));
+        if populated.len() > MAX_DIMMS {
+            out.push_str(&format!(
+                "[{} more memory modules not shown]\n",
+                populated.len() - MAX_DIMMS
+            ));
+        }
+    }
+
+    if !empty_locators.is_empty() {
+        let named: Vec<&str> = empty_locators
+            .iter()
+            .flatten()
+            .take(MAX_EMPTY_SLOTS_SHOWN)
+            .map(String::as_str)
+            .collect();
+        if named.is_empty() {
+            out.push_str(&format!("Empty slots: {}\n", empty_locators.len()));
+        } else if empty_locators.len() > named.len() {
+            out.push_str(&format!(
+                "Empty slots: {} ({}, ...)\n",
+                empty_locators.len(),
+                named.join(", ")
+            ));
+        } else {
+            out.push_str(&format!(
+                "Empty slots: {} ({})\n",
+                empty_locators.len(),
+                named.join(", ")
+            ));
+        }
+    }
+}
+
+/// Basic DMI identity files exposed by the kernel under `/sys/class/dmi/id`.
+#[derive(Default)]
+struct SysfsDmi {
+    sys_vendor: Option<String>,
+    product_name: Option<String>,
+    product_version: Option<String>,
+    product_serial: Option<String>,
+    product_uuid: Option<String>,
+    product_sku: Option<String>,
+    product_family: Option<String>,
+    bios_vendor: Option<String>,
+    bios_version: Option<String>,
+    bios_date: Option<String>,
+    bios_release: Option<String>,
+    board_vendor: Option<String>,
+    board_name: Option<String>,
+    board_version: Option<String>,
+    board_serial: Option<String>,
+    board_asset_tag: Option<String>,
+    chassis_vendor: Option<String>,
+    chassis_type: Option<String>,
+    chassis_version: Option<String>,
+    chassis_serial: Option<String>,
+    chassis_asset_tag: Option<String>,
+    restricted_fields: bool,
+}
+
+fn read_dmi_file(path: &Path, restricted: &mut bool) -> Option<String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            if err.kind() == ErrorKind::PermissionDenied {
+                *restricted = true;
+            }
+            return None;
+        }
+    };
+    let mut data = Vec::new();
+    file.take(SMALL_FILE).read_to_end(&mut data).ok()?;
+    let value = String::from_utf8_lossy(&data).trim().to_string();
+    (!is_dmi_placeholder(&value)).then_some(value)
+}
+
+/// Maps the numeric SMBIOS chassis type in `/sys/class/dmi/id/chassis_type` to its name.
+fn chassis_type_name(code: &str) -> String {
+    match code.trim() {
+        "1" => "Other".to_string(),
+        "2" => "Unknown".to_string(),
+        "3" => "Desktop".to_string(),
+        "4" => "Low Profile Desktop".to_string(),
+        "5" => "Pizza Box".to_string(),
+        "6" => "Mini Tower".to_string(),
+        "7" => "Tower".to_string(),
+        "8" => "Portable".to_string(),
+        "9" => "Laptop".to_string(),
+        "10" => "Notebook".to_string(),
+        "11" => "Hand Held".to_string(),
+        "13" => "All in One".to_string(),
+        "14" => "Sub Notebook".to_string(),
+        "15" => "Space-saving".to_string(),
+        "16" => "Lunch Box".to_string(),
+        "17" => "Main Server Chassis".to_string(),
+        "23" => "Rack Mount Chassis".to_string(),
+        "24" => "Sealed-case PC".to_string(),
+        "25" => "Multi-system".to_string(),
+        "28" => "Blade".to_string(),
+        "29" => "Blade Enclosure".to_string(),
+        "30" => "Tablet".to_string(),
+        "31" => "Convertible".to_string(),
+        "32" => "Detachable".to_string(),
+        "35" => "Mini PC".to_string(),
+        "36" => "Stick PC".to_string(),
+        other => shown(other, 32),
+    }
+}
+
+/// Blocking: reads `/sys/class/dmi/id/*`.
+fn read_sysfs_dmi(sys: &Path) -> SysfsDmi {
+    let base = sys.join("class/dmi/id");
+    let mut restricted = false;
+    let mut read = |file: &str| read_dmi_file(&base.join(file), &mut restricted);
+    SysfsDmi {
+        sys_vendor: read("sys_vendor"),
+        product_name: read("product_name"),
+        product_version: read("product_version"),
+        product_serial: read("product_serial"),
+        product_uuid: read("product_uuid"),
+        product_sku: read("product_sku"),
+        product_family: read("product_family"),
+        bios_vendor: read("bios_vendor"),
+        bios_version: read("bios_version"),
+        bios_date: read("bios_date"),
+        bios_release: read("bios_release"),
+        board_vendor: read("board_vendor"),
+        board_name: read("board_name"),
+        board_version: read("board_version"),
+        board_serial: read("board_serial"),
+        board_asset_tag: read("board_asset_tag"),
+        chassis_vendor: read("chassis_vendor"),
+        chassis_type: read("chassis_type").map(|code| chassis_type_name(&code)),
+        chassis_version: read("chassis_version"),
+        chassis_serial: read("chassis_serial"),
+        chassis_asset_tag: read("chassis_asset_tag"),
+        restricted_fields: restricted,
+    }
+}
+
+fn sysfs_supports_section(section: &str) -> bool {
+    matches!(
+        section,
+        "summary" | "all" | "system" | "bios" | "baseboard" | "chassis"
+    )
+}
+
+/// Formats the sections of `/sys/class/dmi/id` matching `section`. Returns the text and
+/// whether any DMI data was found.
+fn format_sysfs_dmi(dmi: &SysfsDmi, section: &str) -> (String, bool) {
+    if !sysfs_supports_section(section) {
+        return (
+            format!(
+                "[/sys/class/dmi/id does not expose {section} tables; dmidecode is required]\n"
+            ),
+            false,
+        );
+    }
+    let show_all = matches!(section, "summary" | "all");
+    let mut out = String::new();
+    if show_all
+        && let Some(headline) = machine_headline(
+            dmi.sys_vendor.as_deref(),
+            dmi.product_name.as_deref(),
+            dmi.bios_version.as_deref(),
+            dmi.bios_date.as_deref(),
+        )
+    {
+        out.push_str(&format!("Machine: {headline}\n"));
+    }
+
+    let push_section = |out: &mut String, title: &str, pairs: &[(&str, &Option<String>)]| {
+        let rows: Vec<(&str, String)> = pairs
+            .iter()
+            .filter_map(|(label, val)| Some((*label, val.as_ref()?.clone())))
+            .collect();
+        if !rows.is_empty() {
+            out.push_str(&format!("== {title} ==\n"));
+            out.push_str(&format_kv(&rows));
+        }
+    };
+
+    if show_all || section == "system" {
+        push_section(
+            &mut out,
+            "system",
+            &[
+                ("Manufacturer", &dmi.sys_vendor),
+                ("Product", &dmi.product_name),
+                ("Version", &dmi.product_version),
+                ("Serial", &dmi.product_serial),
+                ("UUID", &dmi.product_uuid),
+                ("SKU", &dmi.product_sku),
+                ("Family", &dmi.product_family),
+            ],
+        );
+    }
+    if show_all || section == "bios" {
+        push_section(
+            &mut out,
+            "BIOS",
+            &[
+                ("Vendor", &dmi.bios_vendor),
+                ("Version", &dmi.bios_version),
+                ("Release Date", &dmi.bios_date),
+                ("BIOS Revision", &dmi.bios_release),
+            ],
+        );
+    }
+    if show_all || section == "baseboard" {
+        push_section(
+            &mut out,
+            "baseboard",
+            &[
+                ("Manufacturer", &dmi.board_vendor),
+                ("Product", &dmi.board_name),
+                ("Version", &dmi.board_version),
+                ("Serial", &dmi.board_serial),
+                ("Asset Tag", &dmi.board_asset_tag),
+            ],
+        );
+    }
+    if show_all || section == "chassis" {
+        push_section(
+            &mut out,
+            "chassis",
+            &[
+                ("Manufacturer", &dmi.chassis_vendor),
+                ("Type", &dmi.chassis_type),
+                ("Version", &dmi.chassis_version),
+                ("Serial", &dmi.chassis_serial),
+                ("Asset Tag", &dmi.chassis_asset_tag),
+            ],
+        );
+    }
+
+    let has_data = !out.is_empty();
+    if dmi.restricted_fields {
+        out.push_str("[some DMI fields (serial numbers, UUID) require root privileges to read]\n");
+    }
+    (out, has_data)
+}
+
+/// Fixed `dmidecode` arguments for a validated `section` choice.
+///
+/// AIDEV-NOTE: `section` is constrained by `Param::choice`, and mapped here to static
+/// argument slices so caller input never reaches `dmidecode`'s flags directly.
+fn dmidecode_args(section: &str) -> &'static [&'static str] {
+    match section {
+        "summary" => &[
+            "-q",
+            "-t",
+            "bios",
+            "-t",
+            "system",
+            "-t",
+            "baseboard",
+            "-t",
+            "chassis",
+            "-t",
+            "processor",
+            "-t",
+            "memory",
+        ],
+        "bios" => &["-q", "-t", "bios"],
+        "system" => &["-q", "-t", "system"],
+        "baseboard" => &["-q", "-t", "baseboard"],
+        "chassis" => &["-q", "-t", "chassis"],
+        "processor" => &["-q", "-t", "processor"],
+        "memory" => &["-q", "-t", "memory"],
+        "cache" => &["-q", "-t", "cache"],
+        "connector" => &["-q", "-t", "connector"],
+        "slot" => &["-q", "-t", "slot"],
+        _ => &["-q"],
+    }
+}
+
+fn bound_dmi_output(text: &str, budget: usize, section: &str) -> String {
+    const NOTE_ROOM: usize = 120;
+    let (mut kept, dropped) = keep_head(text, budget.saturating_sub(NOTE_ROOM));
+    if dropped == 0 {
+        return kept;
+    }
+    if !kept.is_empty() && !kept.ends_with('\n') {
+        kept.push('\n');
+    }
+    if section == "all" {
+        kept.push_str(&format!(
+            "[{dropped} more lines left out to fit the output limit; pass section to narrow the output]\n"
+        ));
+    } else {
+        kept.push_str(&format!(
+            "[{dropped} more lines left out to fit the output limit]\n"
+        ));
+    }
+    kept
+}
+
+async fn hardware_info(ctx: Ctx, args: Args, roots: Arc<Roots>) -> ToolResult {
+    let section = args.str("section").unwrap_or("summary").to_string();
+    let auth = ctx.authorize(None)?;
+    let budget = ctx.output_budget();
+
+    // Fail closed if `dmidecode` exists on disk but fails the root-ownership trust check.
+    let dmi_cmd = ctx.optional_command("dmidecode")?;
+
+    if let Some(cmd) = dmi_cmd {
+        let argv = dmidecode_args(&section);
+        match ctx.run(cmd.args(argv.iter().copied())).await {
+            Ok(out) if command_ok(&out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if section == "summary" {
+                    let blocks = parse_dmidecode(&stdout);
+                    let mut text = format_dmi_summary(&blocks);
+                    if !text.is_empty() {
+                        if out.truncated {
+                            text.push_str(
+                                "[output truncated: dmidecode produced more than is kept]\n",
+                            );
+                        }
+                        return auth.ok(bound_dmi_output(&text, budget, &section));
+                    }
+                    // dmidecode exited cleanly but returned no summarized blocks; check sysfs.
+                    let sys = roots.sys.clone();
+                    let sysfs = blocking(ctx.clone(), move || Ok(read_sysfs_dmi(&sys))).await?;
+                    let (body, has_data) = format_sysfs_dmi(&sysfs, &section);
+                    if has_data {
+                        let text = format!(
+                            "[dmidecode returned no SMBIOS records; showing /sys/class/dmi/id]\n{body}"
+                        );
+                        return auth.ok(bound_dmi_output(&text, budget, &section));
+                    }
+                    return auth.ok(
+                        "No SMBIOS/DMI hardware information is available on this host \
+                         (common in containers and some virtual machines).\n",
+                    );
+                }
+
+                let has_records = stdout.lines().any(|line| {
+                    let t = line.trim();
+                    !t.is_empty() && !t.starts_with('#')
+                });
+                if !has_records {
+                    let msg = if section == "all" {
+                        "No SMBIOS/DMI hardware information is available on this host \
+                         (common in containers and some virtual machines).\n"
+                            .to_string()
+                    } else {
+                        format!("No SMBIOS records for section {section:?} on this host.\n")
+                    };
+                    return auth.ok(msg);
+                }
+                let mut text = stdout.trim().to_string();
+                text.push('\n');
+                if out.truncated {
+                    text.push_str("[output truncated: dmidecode produced more than is kept]\n");
+                }
+                return auth.ok(bound_dmi_output(&text, budget, &section));
+            }
+            Ok(out) => {
+                let reason = complaint(&out);
+                let sys = roots.sys.clone();
+                let sysfs = blocking(ctx.clone(), move || Ok(read_sysfs_dmi(&sys))).await?;
+                let (body, has_data) = format_sysfs_dmi(&sysfs, &section);
+                let text = if has_data {
+                    format!(
+                        "[dmidecode failed ({reason}); falling back to /sys/class/dmi/id]\n{body}"
+                    )
+                } else if sysfs_supports_section(&section) {
+                    format!(
+                        "[dmidecode failed ({reason}); no DMI information is available under /sys/class/dmi/id]\n{body}"
+                    )
+                } else {
+                    format!("[dmidecode failed ({reason})]\n{body}")
+                };
+                return auth.done(bound_dmi_output(&text, budget, &section), has_data);
+            }
+            Err(ToolError::Failed(problem)) => {
+                let reason = shown(&problem, 300);
+                let sys = roots.sys.clone();
+                let sysfs = blocking(ctx.clone(), move || Ok(read_sysfs_dmi(&sys))).await?;
+                let (body, has_data) = format_sysfs_dmi(&sysfs, &section);
+                let text = if has_data {
+                    format!(
+                        "[dmidecode failed ({reason}); falling back to /sys/class/dmi/id]\n{body}"
+                    )
+                } else {
+                    format!("[dmidecode failed ({reason})]\n{body}")
+                };
+                return auth.done(bound_dmi_output(&text, budget, &section), has_data);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    // dmidecode is not installed: fall back to /sys/class/dmi/id.
+    let sys = roots.sys.clone();
+    let sysfs = blocking(ctx.clone(), move || Ok(read_sysfs_dmi(&sys))).await?;
+    if !sysfs_supports_section(&section) {
+        return auth.failed(format!(
+            "the `dmidecode` command is not installed on this host (package dmidecode); \
+             /sys/class/dmi/id does not provide {section} tables.\n"
+        ));
+    }
+    let (body, has_data) = format_sysfs_dmi(&sysfs, &section);
+    let note = if matches!(section.as_str(), "summary" | "all") {
+        "[dmidecode is not installed (package dmidecode); showing basic information from \
+         /sys/class/dmi/id — processors, memory slots and other SMBIOS tables require dmidecode]\n"
+    } else {
+        "[dmidecode is not installed (package dmidecode); showing basic information from \
+         /sys/class/dmi/id]\n"
+    };
+    let text = if has_data {
+        format!("{note}{body}")
+    } else {
+        format!(
+            "{note}[no DMI information is available under /sys/class/dmi/id \
+             (common in containers and some virtual machines)]\n{body}"
+        )
+    };
+    auth.ok(bound_dmi_output(&text, budget, &section))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,5 +2635,404 @@ roles = ["other"]
             1,
             "{text}"
         );
+    }
+
+    // ---- hardware_info tests ---------------------------------------------------------
+
+    const SAMPLE_DMI: &str = "\
+# dmidecode 3.5
+BIOS Information
+\tVendor: Dell Inc.
+\tVersion: 2.18.0
+\tRelease Date: 03/15/2025
+\tBIOS Revision: 2.18
+\tFirmware Revision: 6.10
+\tCharacteristics:
+\t\tPCI is supported
+\t\tUEFI is supported
+
+System Information
+\tManufacturer: Dell Inc.
+\tProduct Name: PowerEdge R750
+\tVersion: Not Specified
+\tSerial Number: ABC1234
+\tUUID: 4c4c4544-0042-3110-8032-c3c04f333431
+\tSKU Number: SKU=NotProvided;ModelName=PowerEdge R750
+\tFamily: PowerEdge
+
+Base Board Information
+\tManufacturer: Dell Inc.
+\tProduct Name: 06V45N
+\tVersion: A01
+\tSerial Number: .ABC1234.CNIVC001.
+
+Chassis Information
+\tManufacturer: Dell Inc.
+\tType: Rack Mount Chassis
+\tVersion: To Be Filled By O.E.M.
+\tSerial Number: ABC1234
+\tAsset Tag: RACK-A4-U12
+
+Processor Information
+\tSocket Designation: CPU1
+\tType: Central Processor
+\tManufacturer: Intel(R) Corporation
+\tVersion: Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz
+\tMax Speed: 4000 MHz
+\tCurrent Speed: 2000 MHz
+\tStatus: Populated, Enabled
+\tCore Count: 32
+\tCore Enabled: 32
+\tThread Count: 64
+
+Processor Information
+\tSocket Designation: CPU2
+\tType: Central Processor
+\tVersion: Not Specified
+\tStatus: Unpopulated
+
+Physical Memory Array
+\tLocation: System Board Or Motherboard
+\tUse: System Memory
+\tError Correction Type: Multi-bit ECC
+\tMaximum Capacity: 4 TB
+\tNumber Of Devices: 4
+
+Physical Memory Array
+\tLocation: System Board Or Motherboard
+\tUse: Flash Memory
+\tError Correction Type: None
+\tMaximum Capacity: 32 MB
+\tNumber Of Devices: 1
+
+Memory Device
+\tSize: 32 GB
+\tLocator: A1
+\tBank Locator: Not Specified
+\tType: DDR4
+\tSpeed: 3200 MT/s
+\tConfigured Memory Speed: 2933 MT/s
+\tManufacturer: Samsung
+\tSerial Number: 12345678
+\tPart Number: M393A4K40DB3-CWE
+
+Memory Device
+\tSize: No Module Installed
+\tLocator: A2
+\tType: Unknown
+\tSpeed: Unknown
+\tManufacturer: Not Specified
+\tSerial Number: Not Specified
+\tPart Number: Not Specified
+
+Memory Device
+\tSize: 32768 MB
+\tLocator: B1
+\tType: DDR4
+\tSpeed: 3200 MT/s
+\tConfigured Memory Speed: 3200 MT/s
+\tManufacturer: Samsung
+\tSerial Number: 12345679
+\tPart Number: M393A4K40DB3-CWE
+
+Memory Device
+\tSize: No Module Installed
+\tLocator: B2
+\tType: Unknown
+";
+
+    async fn run_info(
+        roots: &Roots,
+        fake: &FakeBins,
+        user: &str,
+        arguments: serde_json::Value,
+    ) -> (ToolResult, MemorySink) {
+        let (host, sink) = fixture(fake);
+        let tool = find(tools_with(roots.clone()), "hardware_info");
+        (call(&host, user, &tool, arguments).await, sink)
+    }
+
+    #[test]
+    fn parse_dmidecode_handles_quiet_and_verbose_output_and_lists() {
+        let verbose = "\
+# dmidecode 3.5
+Handle 0x0000, DMI type 0, 26 bytes
+BIOS Information
+\tVendor: Example BIOS
+\tVersion: 1.0:beta
+\tCharacteristics:
+\t\tPCI is supported
+\t\tUEFI is supported
+
+Handle 0x0001, DMI type 127, 4 bytes
+End Of Table
+";
+        let blocks = parse_dmidecode(verbose);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].title, "BIOS Information");
+        assert_eq!(blocks[0].field("Vendor"), Some("Example BIOS"));
+        assert_eq!(blocks[0].field("Version"), Some("1.0:beta"));
+        assert_eq!(
+            blocks[0].list("Characteristics"),
+            ["PCI is supported", "UEFI is supported"]
+        );
+    }
+
+    #[test]
+    fn memory_size_parsing_and_formatting_handle_smbios_units() {
+        assert_eq!(parse_dmi_memory_kib("32 GB"), Some(32 * 1024 * 1024));
+        assert_eq!(parse_dmi_memory_kib("16384 MB"), Some(16 * 1024 * 1024));
+        assert_eq!(parse_dmi_memory_kib("1 TB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_dmi_memory_kib("512 kB"), Some(512));
+        assert_eq!(parse_dmi_memory_kib("No Module Installed"), None);
+        assert_eq!(parse_dmi_memory_kib("0 MB"), None);
+        assert_eq!(parse_dmi_memory_kib("999999999999 TB"), None);
+
+        assert_eq!(format_dmi_kib(64 * 1024 * 1024), "64 GB");
+        assert_eq!(format_dmi_kib(1536 * 1024), "1.5 GB");
+        assert_eq!(format_dmi_kib(4 * 1024 * 1024 * 1024), "4 TB");
+        assert_eq!(format_dmi_kib(512 * 1024), "512 MB");
+        assert_eq!(format_dmi_kib(512), "512 kB");
+    }
+
+    #[tokio::test]
+    async fn hardware_info_summarizes_dmidecode_sections_and_omits_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let fake = FakeBins::new().add("dmidecode", SAMPLE_DMI, 0);
+        let (result, _) = run_info(&roots, &fake, "hank", json!({})).await;
+        let text = ok_text(result);
+
+        assert!(
+            text.starts_with("Machine: Dell Inc. PowerEdge R750; BIOS 2.18.0 (03/15/2025)\n"),
+            "{text}"
+        );
+        assert!(text.contains("== system =="), "{text}");
+        assert!(text.contains("ABC1234"), "{text}");
+        assert!(
+            text.contains("4c4c4544-0042-3110-8032-c3c04f333431"),
+            "{text}"
+        );
+        assert!(text.contains("== BIOS =="), "{text}");
+        assert!(text.contains("Boot Mode:     UEFI"), "{text}");
+        assert!(text.contains("== baseboard =="), "{text}");
+        assert!(text.contains("06V45N"), "{text}");
+        assert!(text.contains("== chassis =="), "{text}");
+        assert!(text.contains("Rack Mount Chassis"), "{text}");
+        assert!(text.contains("RACK-A4-U12"), "{text}");
+        // vendor placeholders are filtered out
+        assert!(!text.contains("Not Specified"), "{text}");
+        assert!(!text.contains("To Be Filled By O.E.M."), "{text}");
+        // processors
+        assert!(text.contains("== processors =="), "{text}");
+        assert!(text.contains("32c/64t"), "{text}");
+        assert!(text.contains("2000 MHz (max 4000 MHz)"), "{text}");
+        assert!(text.contains("Unpopulated"), "{text}");
+        // memory: 32 GB + 32768 MB = 64 GB across 2 of 4 slots, System Memory array (not Flash)
+        assert!(
+            text.contains("Total: 64 GB installed across 2 of 4 slots (max 4 TB, Multi-bit ECC)"),
+            "{text}"
+        );
+        assert!(text.contains("2933 MT/s (max 3200 MT/s)"), "{text}");
+        assert!(text.contains("M393A4K40DB3-CWE"), "{text}");
+        assert!(text.contains("Empty slots: 2 (A2, B2)"), "{text}");
+
+        assert_eq!(
+            fake.calls("dmidecode"),
+            vec![vec![
+                "-q",
+                "-t",
+                "bios",
+                "-t",
+                "system",
+                "-t",
+                "baseboard",
+                "-t",
+                "chassis",
+                "-t",
+                "processor",
+                "-t",
+                "memory"
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn hardware_info_returns_detailed_output_for_a_specific_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let mem_only = "Memory Device\n\tSize: 32 GB\n\tLocator: A1\n";
+        let fake = FakeBins::new().add("dmidecode", mem_only, 0);
+
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "memory"})).await;
+        let text = ok_text(result);
+        assert!(text.contains("Memory Device"), "{text}");
+        assert!(text.contains("Size: 32 GB"), "{text}");
+        assert_eq!(fake.calls("dmidecode"), vec![vec!["-q", "-t", "memory"]]);
+
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "all"})).await;
+        ok_text(result);
+        assert_eq!(fake.calls("dmidecode")[1], vec!["-q"]);
+    }
+
+    #[tokio::test]
+    async fn hardware_info_reports_empty_section_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let fake = FakeBins::new().add("dmidecode", "# dmidecode 3.5\n", 0);
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "slot"})).await;
+        let text = ok_text(result);
+        assert!(
+            text.contains("No SMBIOS records for section \"slot\""),
+            "{text}"
+        );
+        assert_eq!(fake.calls("dmidecode"), vec![vec!["-q", "-t", "slot"]]);
+    }
+
+    #[tokio::test]
+    async fn hardware_info_falls_back_to_sysfs_when_dmidecode_is_missing() {
+        let (dir, roots) = healthy();
+        let root = dir.path();
+        put(root, "sys/class/dmi/id/board_vendor", "Supermicro\n");
+        put(root, "sys/class/dmi/id/board_name", "X12DPi-N6\n");
+        put(root, "sys/class/dmi/id/chassis_type", "23\n");
+        put(
+            root,
+            "sys/class/dmi/id/product_version",
+            "To Be Filled By O.E.M.\n",
+        );
+
+        // summary falls back to /sys/class/dmi/id
+        let (result, _) = run_info(&roots, &FakeBins::new(), "hank", json!({})).await;
+        let text = ok_text(result);
+        assert!(text.contains("dmidecode is not installed"), "{text}");
+        assert!(
+            text.contains("Machine: Example Corp Server R1; BIOS 2.4.1 (03/14/2025)"),
+            "{text}"
+        );
+        assert!(text.contains("X12DPi-N6"), "{text}");
+        assert!(text.contains("Rack Mount Chassis"), "{text}");
+        assert!(!text.contains("To Be Filled By O.E.M."), "{text}");
+
+        // bios section falls back to only BIOS fields
+        let (result, _) =
+            run_info(&roots, &FakeBins::new(), "hank", json!({"section": "bios"})).await;
+        let text = ok_text(result);
+        assert!(text.contains("== BIOS =="), "{text}");
+        assert!(text.contains("2.4.1"), "{text}");
+        assert!(!text.contains("== baseboard =="), "{text}");
+
+        // memory section cannot be served from /sys/class/dmi/id
+        let (result, _) = run_info(
+            &roots,
+            &FakeBins::new(),
+            "hank",
+            json!({"section": "memory"}),
+        )
+        .await;
+        let output = result.unwrap();
+        assert!(output.is_error(), "{output:?}");
+        assert!(output.text().contains("dmidecode"), "{}", output.text());
+        assert!(output.text().contains("memory"), "{}", output.text());
+    }
+
+    #[tokio::test]
+    async fn hardware_info_falls_back_to_sysfs_when_dmidecode_fails() {
+        let (_dir, roots) = healthy();
+        let fake = FakeBins::new().add_script(
+            "dmidecode",
+            "echo '/sys/firmware/dmi/tables/smbios_entry_point: Permission denied' >&2\nexit 1\n",
+        );
+
+        let (result, _) = run_info(&roots, &fake, "hank", json!({})).await;
+        let text = ok_text(result);
+        assert!(text.contains("Permission denied"), "{text}");
+        assert!(text.contains("falling back to /sys/class/dmi/id"), "{text}");
+        assert!(text.contains("Example Corp"), "{text}");
+
+        // memory section reports failure when dmidecode fails
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "memory"})).await;
+        let output = result.unwrap();
+        assert!(output.is_error(), "{output:?}");
+        assert!(
+            output.text().contains("Permission denied"),
+            "{}",
+            output.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn hardware_info_handles_a_container_without_dmi_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let (result, _) = run_info(&roots, &FakeBins::new(), "hank", json!({})).await;
+        let text = ok_text(result);
+        assert!(text.contains("no DMI information is available"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn hardware_info_is_authorized_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let fake = FakeBins::new().add("dmidecode", SAMPLE_DMI, 0);
+
+        let (result, sink) = run_info(&roots, &fake, "otto", json!({})).await;
+        assert!(matches!(result, Err(ToolError::Denied(_))), "{result:?}");
+        assert_eq!(fake.calls("dmidecode").len(), 0);
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["decision"], "deny");
+
+        let (result, sink) = run_info(&roots, &fake, "hank", json!({})).await;
+        ok_text(result);
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["decision"], "allow");
+        assert_eq!(records[0]["permission"], "hardware.view");
+    }
+
+    #[tokio::test]
+    async fn hardware_info_rejects_unknown_sections_and_sanitizes_firmware_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let evil =
+            "System Information\n\tManufacturer: Evil\x1b[31mCorp\u{e0041}\n\tProduct Name: Box\n";
+        let fake = FakeBins::new().add("dmidecode", evil, 0);
+
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "--dump"})).await;
+        assert!(matches!(result, Err(ToolError::Invalid(_))), "{result:?}");
+        assert_eq!(fake.calls("dmidecode").len(), 0);
+
+        // summary mode cleans escape sequences and invisible Unicode tag characters
+        let (result, _) = run_info(&roots, &fake, "hank", json!({})).await;
+        let text = ok_text(result);
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(!text.contains('\u{e0041}'), "{text:?}");
+        assert!(text.contains("\\x1b"), "{text:?}");
+        assert!(text.contains("\\u{e0041}"), "{text:?}");
+
+        // raw section mode cleans them too
+        let (result, _) = run_info(&roots, &fake, "hank", json!({"section": "system"})).await;
+        let text = ok_text(result);
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(!text.contains('\u{e0041}'), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn hardware_info_truncates_large_all_output_with_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots_of(&dir);
+        let big: String = (0..200)
+            .map(|i| format!("OEM Strings\n\tString {i}: some firmware entry number {i}\n\n"))
+            .collect();
+        let fake = FakeBins::new().add("dmidecode", &big, 0);
+        let (host, _sink) = host(&format!(
+            "{ROLES}[limits]\nmax_output_bytes = 1024\n{}",
+            fake.config_only()
+        ));
+        let tool = find(tools_with(roots.clone()), "hardware_info");
+        let text = ok_text(call(&host, "hank", &tool, json!({"section": "all"})).await);
+        assert!(text.contains("more lines left out"), "{text}");
+        assert!(text.contains("pass section to narrow"), "{text}");
     }
 }

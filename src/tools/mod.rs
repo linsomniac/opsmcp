@@ -1126,6 +1126,7 @@ roles = ["operator"]
                 "haproxy_server_state",
                 "haproxy_servers",
                 "hardware_health",
+                "hardware_info",
                 "host_reboot",
                 "incident_snapshot",
                 "iptables_list",

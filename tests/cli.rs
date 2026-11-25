@@ -89,7 +89,7 @@ fn check_config_accepts_a_valid_configuration_and_summarises_it() {
         .lines()
         .find(|l| l.trim_start().starts_with("admin"))
         .expect(&stdout);
-    assert!(admin.contains("87 tools"), "{admin}");
+    assert!(admin.contains("88 tools"), "{admin}");
     assert!(stdout.contains(&me()), "{stdout}");
 }
 
@@ -823,8 +823,8 @@ fn a_fleet_reaches_every_host_through_one_connection() {
         "fleet_host"
     );
     find("fleet_hosts");
-    // 87 built-in tools and the fleet's own three
-    assert_eq!(tools.len(), 90);
+    // 88 built-in tools and the fleet's own three
+    assert_eq!(tools.len(), 91);
     // nothing has been asked of any host yet
     assert!(setup.ssh_calls().is_empty());
 
