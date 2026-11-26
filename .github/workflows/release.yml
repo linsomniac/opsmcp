@@ -1,7 +1,7 @@
 name: Release
 
 # Pushing a tag vX.Y.Z (the version in Cargo.toml) publishes a GitHub release with the
-# static binaries in tarballs, the .deb packages for Ubuntu 26.04 and their checksums.
+# static binaries in tarballs, the .deb packages and their checksums.
 on:
   push:
     tags:

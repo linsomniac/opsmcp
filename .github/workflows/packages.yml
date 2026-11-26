@@ -1,9 +1,10 @@
 name: Packages
 
 # Builds and checks everything a release ships: statically linked binaries in tarballs,
-# and .deb packages for Ubuntu 26.04. CI calls this for every push, so that packaging
-# is never tried for the first time on the day of a release; Release calls it for a tag
-# and publishes what it uploads.
+# and .deb packages built on Ubuntu 22.04 (forward-compatible with 24.04, 26.04 and newer,
+# and Debian 12+). CI calls this for every push, so that packaging is never tried for the
+# first time on the day of a release; Release calls it for a tag and publishes what it
+# uploads.
 #
 # AIDEV-NOTE: the packaging itself is scripts/package-release.sh, which runs the same
 # way on a developer's machine. Keep the steps here to installing a toolchain, building
@@ -83,7 +84,7 @@ jobs:
           compression-level: 0
 
   deb:
-    name: Ubuntu 26.04 package (${{ matrix.arch }})
+    name: Debian package (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -95,9 +96,10 @@ jobs:
             arch: arm64
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
-    # Built on the release it is for: the binary links against that release's libraries
-    # and the package's dependencies are read from them.
-    container: ubuntu:26.04
+    # Built on Ubuntu 22.04 (the oldest supported LTS): glibc is forward-compatible, so
+    # the binary links against 22.04's libc6 and runs on 22.04, 24.04, 26.04 and newer
+    # releases (and Debian 12+) while still using the system C library for NSS (LDAP/sssd).
+    container: ubuntu:22.04
     timeout-minutes: 30
     env:
       DEBIAN_FRONTEND: noninteractive
@@ -126,8 +128,8 @@ jobs:
 
       # This container is thrown away after the job, so the package can be installed
       # in it: that it installs, runs, switches nothing on and removes cleanly.
-      - name: Install the package and try it
-        run: scripts/test-deb.sh dist/opsmcp_*_ubuntu26.04_${{ matrix.arch }}.deb
+      - name: Install the package and try it on Ubuntu 22.04
+        run: scripts/test-deb.sh dist/opsmcp_*_${{ matrix.arch }}.deb
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -136,3 +138,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
           compression-level: 0
+
+  # Verify the Ubuntu 22.04-built .deb installs and runs cleanly on newer Ubuntu LTS
+  # releases as well.
+  deb-test:
+    name: Test .deb on newer Ubuntu (${{ matrix.arch }})
+    needs: deb
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Download package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-deb-${{ matrix.arch }}
+          path: dist
+
+      - name: Test on Ubuntu 24.04
+        run: |
+          shopt -s nullglob
+          debs=(dist/opsmcp_*_${{ matrix.arch }}.deb)
+          [[ ${#debs[@]} -eq 1 ]] || {
+            echo "expected one .deb in dist/, found ${#debs[@]}: ${debs[*]}" >&2
+            exit 1
+          }
+          docker run --rm -v "$PWD:/src:ro" ubuntu:24.04 \
+            /src/scripts/test-deb.sh "/src/${debs[0]}"
+
+      - name: Test on Ubuntu 26.04
+        run: |
+          shopt -s nullglob
+          debs=(dist/opsmcp_*_${{ matrix.arch }}.deb)
+          [[ ${#debs[@]} -eq 1 ]] || {
+            echo "expected one .deb in dist/, found ${#debs[@]}: ${debs[*]}" >&2
+            exit 1
+          }
+          docker run --rm -v "$PWD:/src:ro" ubuntu:26.04 \
+            /src/scripts/test-deb.sh "/src/${debs[0]}"

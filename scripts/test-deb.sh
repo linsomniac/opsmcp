@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Installs a .deb made by package-release.sh on THIS system and checks what it did.
 #
-#   scripts/test-deb.sh dist/opsmcp_VERSION_SUITE_ARCH.deb
+#   scripts/test-deb.sh dist/opsmcp_VERSION_ARCH.deb
 #
 # For a throwaway container or CI job only: it runs as root, installs and removes
 # packages (opsmcp and sudo), and edits the configuration in /etc/opsmcp. For example:
 #
-#   docker run --rm -v "$PWD":/src:ro ubuntu:26.04 /src/scripts/test-deb.sh /src/dist/opsmcp_...deb
+#   docker run --rm -v "$PWD":/src:ro ubuntu:24.04 /src/scripts/test-deb.sh /src/dist/opsmcp_...deb
 set -euo pipefail
 
 [[ $# -eq 1 && -f $1 ]] || {
@@ -36,7 +36,7 @@ check "the binary runs here and says which version it is"
 packaged=$(dpkg-deb -f "$deb" Version)
 running=$(opsmcp --version)
 [[ $running == opsmcp\ * ]] || fail "opsmcp --version printed \"$running\""
-[[ ${packaged//\~/-} == "${running#opsmcp }"-1-* ]] ||
+[[ ${packaged//\~/-} == "${running#opsmcp }"-1 || ${packaged//\~/-} == "${running#opsmcp }"-1-* ]] ||
     fail "the package is version $packaged but the binary says \"$running\""
 
 # The README is in the package too, but under /usr/share/doc, which minimal Ubuntu

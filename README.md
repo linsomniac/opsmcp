@@ -60,11 +60,11 @@ Each [release](https://github.com/linsomniac/opsmcp/releases) has these, with a
 
 | File | For |
 | --- | --- |
-| `opsmcp_VERSION_ubuntu26.04_amd64.deb`, `..._arm64.deb` | Ubuntu 26.04 |
+| `opsmcp_VERSION_amd64.deb`, `..._arm64.deb` | Ubuntu 22.04, 24.04, 26.04 and newer (and Debian 12+) |
 | `opsmcp-VERSION-x86_64-unknown-linux-musl.tar.gz`, `...-aarch64-...` | any distribution: a statically linked binary, the examples and the unit files |
 
 ```sh
-sudo apt install ./opsmcp_0.1.1_ubuntu26.04_amd64.deb
+sudo apt install ./opsmcp_0.1.1_amd64.deb
 ```
 
 The package installs `/usr/bin/opsmcp`, the two unit files (not enabled), and:
@@ -127,7 +127,8 @@ fleet server runs on its hosts, so that a NixOS host answers like any other.
 
 To make the packages yourself: `scripts/package-release.sh tarball TARGET` or
 `scripts/package-release.sh deb TARGET` after `cargo build --release --target TARGET`
-(a `.deb` is for the release of Debian or Ubuntu it is built on), and
+(a `.deb` built with glibc runs on the release it was built on and newer ones; release
+packages are built on Ubuntu 22.04 and tested on 22.04, 24.04 and 26.04), and
 `scripts/test-deb.sh` installs one in a throwaway container and tries it.
 
 ### Building for other hosts

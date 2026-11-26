@@ -2,16 +2,17 @@
 # Packages a release binary that cargo has already built.
 #
 #   scripts/package-release.sh tarball TARGET    dist/opsmcp-VERSION-TARGET.tar.gz
-#   scripts/package-release.sh deb TARGET        dist/opsmcp_VERSION_SUITE_ARCH.deb
+#   scripts/package-release.sh deb TARGET        dist/opsmcp_VERSION_ARCH.deb
 #
 # TARGET is the Rust target the binary was built for:
 #
 #   cargo build --release --locked --target TARGET
 #
 # A tarball is meant for a statically linked binary (a *-linux-musl target), which runs
-# on any distribution. A .deb is for the release of Debian or Ubuntu it is built on:
-# SUITE and ARCH are this system's (ubuntu26.04, amd64), and the package's dependencies
-# are worked out from the libraries the binary was linked against here.
+# on any distribution. A .deb runs on the release of Debian or Ubuntu it was built on and
+# newer releases (glibc is forward-compatible), or anywhere if built from a static musl
+# target; ARCH is this system's (amd64, arm64), and the package's dependencies are worked
+# out from the libraries the binary was linked against here.
 #
 # AIDEV-NOTE: the GitHub workflows and a developer's machine both package with this one
 # script, so that what CI checks is what a release ships. Neither kind of package
@@ -115,16 +116,9 @@ for tool in dpkg dpkg-deb dpkg-shlibdeps; do
     }
 done
 arch=$(dpkg --print-architecture)
-# shellcheck disable=SC1091
-suite=$(. /etc/os-release && printf '%s%s' "$ID" "$VERSION_ID")
-[[ $suite =~ ^[a-z]+[0-9.]+$ ]] || {
-    echo "could not tell which release this is from /etc/os-release (got \"$suite\")" >&2
-    exit 1
-}
 # A pre-release (1.2.0-rc1) has to sort before its release, which "~" does and "-" does
-# not. The suite is part of the version so that builds for two releases of Ubuntu are
-# two versions, the one for the newer release being the newer.
-deb_version="${version//-/\~}-1~${suite}"
+# not.
+deb_version="${version//-/\~}-1"
 
 root="$stage/deb"
 doc="$root/usr/share/doc/opsmcp"
@@ -208,7 +202,8 @@ chmod 0644 "$root/DEBIAN/md5sums"
 
 # GitHub rewrites "~" in the name of a release asset, so the file is named without the
 # package's own version string.
-deb="$dist/opsmcp_${version}_${suite}_${arch}.deb"
+deb="$dist/opsmcp_${version}_${arch}.deb"
 rm -f -- "$deb"
-dpkg-deb --root-owner-group --build "$root" "$deb" >/dev/null
+# xz is supported by every dpkg release; Ubuntu's default zstd is rejected by older dpkg.
+dpkg-deb --root-owner-group -Zxz --build "$root" "$deb" >/dev/null
 printf 'created %s (version %s)\n' "$deb" "$deb_version"
