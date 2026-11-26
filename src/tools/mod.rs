@@ -602,6 +602,13 @@ pub mod testing {
             format!("[paths]\nsearch = [\"/nonexistent\"]\n{}", self.config())
         }
 
+        /// The configuration that makes the server find these commands by looking for
+        /// them, as it finds the ones a host has installed, and find no others. None is
+        /// named in `[paths.bin]`.
+        pub fn config_searched(&self) -> String {
+            format!("[paths]\nsearch = [\"{}\"]\n", self.dir.path().display())
+        }
+
         /// The `[paths.bin]` configuration that makes the server use these commands.
         pub fn config(&self) -> String {
             let mut text = "[paths.bin]\n".to_string();

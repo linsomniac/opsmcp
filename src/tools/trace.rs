@@ -15,7 +15,7 @@ use super::{
     Authorized, CallClock, Ctx, Tool, ToolError, ToolResult, blocking, command_ok, command_text,
     required,
 };
-use crate::exec::CmdOutput;
+use crate::exec::{Cmd, CmdOutput};
 use crate::glob::glob_match;
 use crate::policy::Access;
 use crate::sanitize::{keep_head, keep_tail, redact_text};
@@ -342,6 +342,25 @@ pub fn trace_argv(strace: &str, pid: i32, seconds: u64, mode: Mode, class: &str)
     argv
 }
 
+/// The command that runs strace and ends it: `gnutimeout` where a host has one,
+/// `timeout` otherwise.
+///
+/// AIDEV-NOTE: found on Ubuntu 26.04, where `timeout` is the Rust one (uutils coreutils
+/// 0.10.0) and GNU's is installed beside it as `gnutimeout`. Given both `-s INT` and
+/// `-k`, the Rust one kills the command when its time is up (exit status 137) and the
+/// command never gets to act on the interrupt, so strace printed nothing and every trace
+/// failed. Either option alone works there; both are needed here (see `trace_argv`).
+/// A `timeout` that the configuration names in `[paths.bin]` is used whatever else is
+/// installed: the operator has said which one to run.
+fn timeout_command(ctx: &Ctx) -> Result<Cmd, ToolError> {
+    if !ctx.bins().is_configured("timeout")
+        && let Some(gnu) = ctx.optional_command("gnutimeout")?
+    {
+        return Ok(gnu);
+    }
+    ctx.command("timeout")
+}
+
 /// What to show of a finished trace, and whether it counts as a success.
 pub fn trace_text(out: &CmdOutput, mode: Mode, lines: usize, budget: usize) -> (String, bool) {
     // strace writes to stderr; nothing is expected on stdout.
@@ -515,8 +534,7 @@ async fn process_trace(ctx: Ctx, args: Args) -> ToolResult {
         "strace",
         "strace is not installed on this host (package strace)",
     )?;
-    let mut cmd = ctx
-        .command("timeout")?
+    let mut cmd = timeout_command(&ctx)?
         .args(trace_argv(&strace, pid, seconds, mode, &class))
         .timeout(Duration::from_secs(seconds + TRACE_SLACK_SECS));
     cmd.max_output = match mode {
@@ -1398,6 +1416,11 @@ mod tests {
     /// adam may do everything, rita holds `@read`, sam may trace and profile only his
     /// own `sleep`, nina only a process called nginx. `trace` is the body of `[trace]`.
     fn fixture(fake: &FakeBins, trace: &str) -> (Arc<Host>, MemorySink) {
+        fixture_with(&fake.config_only(), trace)
+    }
+
+    /// Like `fixture`, with `paths` as the configuration that says where commands are.
+    fn fixture_with(paths: &str, trace: &str) -> (Arc<Host>, MemorySink) {
         let me = me();
         host(&format!(
             r#"
@@ -1419,8 +1442,7 @@ roles = ["sleeper"]
 roles = ["web"]
 [trace]
 {trace}
-{}"#,
-            fake.config_only()
+{paths}"#
         ))
     }
 
@@ -1660,6 +1682,60 @@ roles = ["web"]
         assert!(message.contains("strace is not installed"), "{message}");
         assert!(message.contains("package strace"), "{message}");
         assert!(fake.calls("timeout").is_empty());
+    }
+
+    /// What Ubuntu 26.04 has installed: a `timeout` that kills strace when its time is
+    /// up, so that nothing is printed, and GNU's beside it as `gnutimeout`.
+    fn tracer_with_gnutimeout() -> FakeBins {
+        FakeBins::new()
+            .add("timeout", "", 137)
+            .add_script("gnutimeout", &format!("{}exit 124", on_stderr(SUMMARY)))
+            .add("strace", "strace ran directly\n", 0)
+    }
+
+    #[tokio::test]
+    async fn process_trace_prefers_gnutimeout_where_it_is_installed() {
+        let fake = tracer_with_gnutimeout();
+        let (host, _audit) = fixture_with(&fake.config_searched(), &allow_sleep());
+        let child = Sleeper::start();
+        let text = ok_text(
+            trace(
+                &host,
+                "sam",
+                json!({"pid": child.pid(), "name": "sleep", "seconds": 2}),
+            )
+            .await,
+        );
+        let calls = fake.calls("gnutimeout");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][..5], strings(&["-s", "INT", "-k", "3", "2"]));
+        assert!(fake.calls("timeout").is_empty());
+        assert!(text.contains("restart_syscall"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn process_trace_uses_timeout_where_there_is_no_gnutimeout() {
+        let fake = tracer(SUMMARY, 124);
+        let (host, _audit) = fixture_with(&fake.config_searched(), &allow_sleep());
+        let child = Sleeper::start();
+        let text = ok_text(trace(&host, "sam", json!({"pid": child.pid(), "name": "sleep"})).await);
+        assert_eq!(fake.calls("timeout").len(), 1);
+        assert!(text.contains("restart_syscall"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn process_trace_uses_the_timeout_the_configuration_names() {
+        // gnutimeout is installed, but [paths.bin] says which timeout to run: that
+        // stands, whatever else the host has.
+        let installed = FakeBins::new().add("gnutimeout", "", 137);
+        let named = tracer(SUMMARY, 124);
+        let paths = format!("{}{}", installed.config_searched(), named.config());
+        let (host, _audit) = fixture_with(&paths, &allow_sleep());
+        let child = Sleeper::start();
+        let text = ok_text(trace(&host, "sam", json!({"pid": child.pid(), "name": "sleep"})).await);
+        assert_eq!(named.calls("timeout").len(), 1);
+        assert!(installed.calls("gnutimeout").is_empty());
+        assert!(text.contains("restart_syscall"), "{text}");
     }
 
     #[tokio::test]

@@ -1019,7 +1019,10 @@ are, and tracing slows the process down, so the tool is tagged write and granted
 name, like `packet_capture`. `cpu_profile` samples with `perf` and lists where CPU
 time went, for one process or, with `trace.system_wide`, the whole host. Both work
 only on processes matching `trace.processes`, and you state the name of the process
-you mean, as with `process_signal`.
+you mean, as with `process_signal`. `strace` is ended by `timeout`: by `gnutimeout`
+where a host has one (Ubuntu 26.04, whose own `timeout` cannot end a trace cleanly),
+unless `[paths.bin]` names a `timeout`. Where `strace` or `perf` is not installed, the
+tool that needs it says so and names the package.
 
 **Headroom.** `limits_headroom` lists the limits a host can run into without the usual
 graphs showing it (open files, process ids, inotify watches, connection tracking, TCP

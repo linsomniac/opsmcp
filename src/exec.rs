@@ -360,6 +360,11 @@ impl Bins {
         Ok(None)
     }
 
+    /// Whether the configuration names the location of this command (`[paths.bin]`).
+    pub fn is_configured(&self, name: &str) -> bool {
+        self.overrides.contains_key(name)
+    }
+
     /// Like `find`, but for an operator-configured absolute path.
     pub fn check_program(&self, path: &Path) -> Result<(), String> {
         match &self.trust {
@@ -707,8 +712,10 @@ mod tests {
             search: vec![dir.path().to_path_buf()],
             bin: BTreeMap::new(),
         };
+        assert!(!Bins::new(&paths, None).is_configured("mytool"));
         paths.bin.insert("mytool".to_string(), elsewhere.clone());
         assert_eq!(Bins::new(&paths, None).find("mytool").unwrap(), elsewhere);
+        assert!(Bins::new(&paths, None).is_configured("mytool"));
         // a configured location that does not exist is an error, not a fallback
         paths
             .bin
