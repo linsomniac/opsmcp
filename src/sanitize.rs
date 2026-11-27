@@ -414,7 +414,9 @@ fn is_option_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
 }
 
-fn is_sensitive(name: &str) -> bool {
+/// Whether a name (of a variable, an option, a property) says that its value is a
+/// secret. Errs towards yes.
+pub fn is_sensitive(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
         "pass",

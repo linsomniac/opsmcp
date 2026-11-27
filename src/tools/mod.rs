@@ -14,6 +14,7 @@ pub mod edit;
 pub mod firewall;
 pub mod fs;
 pub mod fwset;
+pub mod ganeti;
 pub mod haproxy;
 pub mod hardware;
 pub mod headroom;
@@ -22,6 +23,7 @@ pub mod kernel;
 pub mod kernelinfo;
 pub mod logs;
 pub mod lvm;
+pub mod megaraid;
 pub mod monitoring;
 pub mod mounts;
 pub mod net;
@@ -45,6 +47,7 @@ pub mod triage;
 pub mod unitres;
 pub mod users;
 pub mod wait;
+pub mod zfs;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -349,6 +352,9 @@ fn built_in_tools() -> Vec<Tool> {
     tools.extend(db::tools());
     tools.extend(kernelinfo::tools());
     tools.extend(hardware::tools());
+    tools.extend(megaraid::tools());
+    tools.extend(zfs::tools());
+    tools.extend(ganeti::tools());
     tools
 }
 
@@ -1130,6 +1136,7 @@ roles = ["operator"]
                 "fs_read",
                 "fs_search",
                 "fs_stat",
+                "ganeti_status",
                 "haproxy_server_state",
                 "haproxy_servers",
                 "hardware_health",
@@ -1146,6 +1153,7 @@ roles = ["operator"]
                 "log_read",
                 "log_summary",
                 "lvm_extend",
+                "megaraid_status",
                 "memory_info",
                 "monitoring_downtime",
                 "mount_health",
@@ -1187,6 +1195,7 @@ roles = ["operator"]
                 "user_list",
                 "user_modify",
                 "wait_for",
+                "zfs_status",
             ]
         );
     }
@@ -1207,6 +1216,7 @@ roles = ["operator"]
             "firewall.view",
             "fs.read",
             "fs.view",
+            "ganeti.view",
             "haproxy.view",
             "hardware.view",
             "history.view",

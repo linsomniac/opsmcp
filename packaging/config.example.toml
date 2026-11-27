@@ -242,6 +242,7 @@ disabled = []
 
 # [paths.bin]
 # systemctl = "/usr/bin/systemctl" # the exact location of one command
+# megacli = "/opt/MegaRAID/MegaCli/MegaCli64" # the vendor's package puts MegaCli here
 
 # ---- Custom tools --------------------------------------------------------------------
 #

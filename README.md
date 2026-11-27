@@ -15,10 +15,14 @@ apart from the few points recorded under [Security model](#security-model) and
 [Not included yet](#not-included-yet). The database, HAProxy, history, configuration
 editing, firewall-set, tracing and package-cache tools have been run against the real
 programs in a test container (Patroni 3.2 and 4.1 on etcd, PostgreSQL 16, MariaDB
-10.11, HAProxy 2.8, sysstat, nftables, strace, apt). Much else has only been exercised
-against stand-in commands: Icinga, Galera, MySQL, rpm/dnf, LVM, ipset, smartctl, IPMI,
-dmidecode, Pacemaker, chrony, perf across a whole host, and the tools that change systemd units,
-sessions, accounts, packages and volumes. It has not yet run in production.
+10.11, HAProxy 2.8, sysstat, nftables, strace, apt), and the ZFS and Ganeti tools in
+test machines (ZFS 2.2, and a one-node Ganeti 3.0 cluster). The MegaRAID tool has read
+the reports of one real controller, a healthy one (MegaCli 8.07 on a PERC H730P); what
+it says of failed drives and degraded arrays rests on samples. Much else has only been
+exercised against stand-in commands: Icinga, Galera, MySQL, rpm/dnf, LVM, ipset,
+smartctl, IPMI, dmidecode, Pacemaker, chrony, perf across a whole host, and the tools
+that change systemd units, sessions, accounts, packages and volumes. It has not yet run
+in production.
 
 One connection can also reach a whole fleet of such hosts: see
 [Fleets](#fleets-one-connection-to-many-hosts).
@@ -794,6 +798,8 @@ The "resource" column is what a grant's part after the colon is matched against.
 | `cve_status` | read | `package.view` | |
 | `db_status` | read | `db.view` | engine: `mariadb`, `postgres` or `patroni` |
 | `hardware_health`, `hardware_info` | read | `hardware.view` | |
+| `megaraid_status`, `zfs_status` | read | `storage.view` | |
+| `ganeti_status` | read | `ganeti.view` | |
 | custom tools | as configured | `custom.NAME` | |
 
 Paths are always judged by where they really are, after links are resolved. A link in
@@ -1088,6 +1094,55 @@ reads the SMBIOS/DMI tables through `dmidecode` (system, BIOS, baseboard, chassi
 processor sockets and memory slots by default, or any section in full) and falls back to
 `/sys/class/dmi/id` when `dmidecode` is absent or cannot read the tables. On a virtual
 machine most of both is empty, and they say so.
+
+**Hardware RAID.** `megaraid_status` reads LSI, Avago and Broadcom MegaRAID controllers
+and Dell PERC through MegaCli: each controller with its firmware and battery, every
+virtual drive (RAID level, size, state, cache policy, a rebuild or consistency check in
+progress) and every physical drive (slot, state, model, media errors, predicted
+failures, SMART alert). The first line is the verdict; it also says when an array has
+dropped from WriteBack to WriteThrough, which is what a failed battery does to write
+speed while everything still reads "Optimal". If MegaCli fails to give one of its
+reports, or gives only part of it, the first line says the summary is incomplete
+instead of calling what was read healthy. `view=controller`, `virtual_drives`,
+`drives` or `battery` gives MegaCli's own report for that part, untouched. MegaCli is
+looked for as `megacli`, `MegaCli64` and `MegaCli`; the vendor's package installs into
+`/opt/MegaRAID/MegaCli`, where commands are not looked for, so name it:
+
+```toml
+[paths.bin]
+megacli = "/opt/MegaRAID/MegaCli/MegaCli64"
+```
+
+MegaCli is always run with `-NoLog` (otherwise it leaves a `MegaSAS.log` behind). Software
+RAID (md) is in `block_devices`.
+
+**ZFS.** `zfs_status` shows every pool with its size, how full and fragmented it is and
+its health, what `zpool status -x` says about a pool with a problem, and the size of the
+ARC. `view=pools` is the full `zpool status` (devices, errors, scrub and resilver
+progress), `view=datasets` the filesystems and volumes with their space, `view=snapshots`
+the newest snapshots, and `view=properties` every property of one pool, dataset or
+snapshot; the value of a user property whose name says it is a secret
+(`com.example:password`) is masked. It only ever runs `zpool list`, `zpool status`,
+`zpool get`, `zfs list` and `zfs get`, and runs nothing at all while the ZFS kernel
+module is not loaded, so that looking never loads it.
+
+**Ganeti.** `ganeti_status` lists the instances of a Ganeti cluster with their state,
+node, vCPUs, memory, disks and addresses, and names any that is in an error state
+(`ERROR_down`: it should be running and is not). `view=instance` shows one instance in
+full: a summary with what it uses now and its tags, then Ganeti's own `gnt-instance
+info` report with every disk, its device and state, every NIC, and the hypervisor and
+backend parameters. `view=nodes` shows the nodes with their role, memory and disk space
+(and a warning for one that is offline, drained or not answering), and `view=jobs` the
+newest jobs and how each ended. Ganeti answers only on the cluster's master node; on any
+other node the answer is Ganeti's own error, which names the master. The permission is
+`ganeti.view`, part of `@read`.
+
+Nothing it runs changes an instance, but `gnt-instance info` is not as light as the
+lists: Ganeti runs it as a job (it appears in `view=jobs` as `INSTANCE_QUERY_DATA`) that
+waits while another job works on the same instance. When it does not answer in time,
+the summary, which never waits, is still returned. In the report, an OS parameter whose
+name says it is a secret has its value masked, as has the DRBD shared secret that old
+versions of Ganeti print.
 
 ## Custom tools
 
